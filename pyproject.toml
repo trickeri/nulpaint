@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nulpaint"
+version = "0.0.1"
+description = "Voice-controlled and agentic AI control for a forked Krita, over a local socket bridge."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "trickeri" }]
+keywords = ["krita", "painting", "photoshop", "voice", "asr", "mcp"]
+
+# Core stays dependency-light so the package imports cross-platform.
+# (The in-Krita plugin half runs under Krita's embedded PyQt5 and must NOT
+#  depend on anything outside Krita's interpreter — keep that half stdlib-only.)
+dependencies = []
+
+[project.optional-dependencies]
+# Agent path: expose Krita editing tools to an LLM.
+mcp = ["mcp>=1.0.0"]
+# Realtime command path (constrained-grammar streaming recognizer).
+voice = ["vosk>=0.3.45", "sounddevice>=0.4.6"]
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+nulpaint-mcp = "nulpaint.mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nulpaint"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

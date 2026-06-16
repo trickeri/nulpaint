@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=nulpaint
+X-Python-2-Compatible=false
+X-Krita-Manual=README.md
+Name=NulPaint
+Comment=Voice + agentic control bridge for Krita
