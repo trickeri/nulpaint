@@ -32,6 +32,9 @@ HOST = "127.0.0.1"
 PORT = 8765
 ENCODING = "utf-8"
 
+# Keeps a running synthetic-stroke QTimer alive (would otherwise be GC'd).
+_active_stroke = {}
+
 
 class _GuiDispatcher(QObject):
     """Marshals a (cmd, args, reply-box) job onto the GUI thread."""
@@ -189,15 +192,213 @@ def _cmd_document_save(args):
     if doc is None:
         raise RuntimeError("no active document")
     path = args.get("path")
-    if path:
-        doc.setFileName(path)
-        ok = doc.saveAs(path)
-    else:
-        if not doc.fileName():
-            raise RuntimeError("document has no path yet; pass 'path'")
-        ok = doc.save()
-    doc.waitForDone()
+    # Force batchmode so export/overwrite dialogs don't block the GUI thread.
+    prev_batch = doc.batchmode()
+    doc.setBatchmode(True)
+    try:
+        if path:
+            doc.setFileName(path)
+            ok = doc.saveAs(path)
+        else:
+            if not doc.fileName():
+                raise RuntimeError("document has no path yet; pass 'path'")
+            ok = doc.save()
+        doc.waitForDone()
+    finally:
+        doc.setBatchmode(prev_batch)
     return {"ok": bool(ok), "fileName": doc.fileName(), "modified": doc.modified()}
+
+
+def _cmd_list_windows(_args):
+    """List visible top-level widgets — handy for spotting blocking dialogs."""
+    try:
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover
+        from PyQt5.QtWidgets import QApplication
+    out = []
+    for w in QApplication.topLevelWidgets():
+        if w.isVisible():
+            out.append({"class": w.metaObject().className(),
+                        "title": w.windowTitle(), "modal": bool(w.isModal())})
+    return out
+
+
+def _cmd_close_dialogs(args):
+    """Dismiss visible top-level dialogs (e.g. the autosave-recovery prompt).
+
+    args: accept=bool — True clicks the default/accept button, False (default)
+    rejects/cancels. Returns the titles/classes of what was closed.
+    """
+    try:
+        from PyQt6.QtWidgets import QApplication, QDialog
+    except ImportError:  # pragma: no cover
+        from PyQt5.QtWidgets import QApplication, QDialog
+    accept = bool(args.get("accept", False))
+    closed = []
+    for w in list(QApplication.topLevelWidgets()):
+        if isinstance(w, QDialog) and w.isVisible():
+            closed.append(w.windowTitle() or w.metaObject().className())
+            (w.accept if accept else w.reject)()
+    return {"closed": closed, "accept": accept}
+
+
+def _find_canvas_widget():
+    """The KisOpenGLCanvas2/KisQPainterCanvas widget — the input event receiver."""
+    try:
+        from PyQt6.QtWidgets import QApplication, QWidget
+    except ImportError:  # pragma: no cover
+        from PyQt5.QtWidgets import QApplication, QWidget
+    win = Krita.instance().activeWindow()
+    qwin = win.qwindow() if win else None
+    roots = [qwin] if qwin is not None else list(QApplication.topLevelWidgets())
+    found = []
+    for root in roots:
+        if root is None:
+            continue
+        for w in root.findChildren(QWidget):
+            cn = w.metaObject().className()
+            if "Canvas" in cn and ("OpenGL" in cn or "QPainter" in cn) \
+                    and w.isVisible() and w.width() > 100 and w.height() > 100:
+                found.append(w)
+    found.sort(key=lambda w: w.width() * w.height(), reverse=True)
+    return found[0] if found else None
+
+
+def _gen_jitter_arc(w, h, n):
+    """A smooth left→right arch with deterministic high-frequency jitter on top.
+    Good smoothing should erase the jitter while keeping the arch."""
+    import math
+    x0, x1 = int(w * 0.12), int(w * 0.88)
+    midy = int(h * 0.55)
+    amp = min(160, int(h * 0.18))
+    pts = []
+    for i in range(n):
+        t = i / (n - 1)
+        x = x0 + (x1 - x0) * t
+        arc = amp * math.sin(t * math.pi)                 # the signal: a clean arch
+        jit = 13 * ((i % 2) * 2 - 1) + 9 * math.sin(i * 0.9)  # the noise (deterministic)
+        pts.append((x, midy - arc + jit))
+    return pts
+
+
+def _cmd_brush_stroke(args):
+    """Inject a freehand brush stroke through Krita's real tool + smoothing path.
+
+    Posts synthetic mouse events (non-synthesized source, so the input manager
+    won't eat them) along a jittery arc, paced by a QTimer so the stabilizer has
+    real time to track. Returns immediately; the stroke finishes asynchronously.
+    args: points [[x,y]...] in canvas-widget px (optional), n, interval_ms.
+    """
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QMouseEvent, QFocusEvent
+        from PyQt6.QtCore import Qt, QPointF, QEvent, QTimer
+        _press = QEvent.Type.MouseButtonPress
+        _move = QEvent.Type.MouseMove
+        _release = QEvent.Type.MouseButtonRelease
+        _focusin = QEvent.Type.FocusIn
+        _otherreason = Qt.FocusReason.OtherFocusReason
+        _LB, _NB = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+        _nomod = Qt.KeyboardModifier.NoModifier
+    except ImportError:  # pragma: no cover — Qt5 fallback
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtGui import QMouseEvent, QFocusEvent
+        from PyQt5.QtCore import Qt, QPointF, QEvent, QTimer
+        _press, _move, _release = (QEvent.MouseButtonPress, QEvent.MouseMove,
+                                   QEvent.MouseButtonRelease)
+        _focusin = QEvent.FocusIn
+        _otherreason = Qt.OtherFocusReason
+        _LB, _NB, _nomod = Qt.LeftButton, Qt.NoButton, Qt.NoModifier
+
+    app = Krita.instance()
+    win = app.activeWindow()
+    doc = app.activeDocument()
+    view = win.activeView() if win is not None else None
+    if doc is None or view is None:
+        raise RuntimeError("need an active document and view")
+
+    diag = {}
+    act = app.action("KritaShape/KisToolBrush")
+    diag["tool_action_found"] = act is not None
+    if act is not None:
+        act.trigger()
+
+    # Foreground -> opaque black so the stroke is visible on a white canvas.
+    # Reuse the view's own colour object so the colour space matches.
+    try:
+        fg = view.foregroundColor()
+        comps = fg.components()
+        comps = [0.0] * len(comps)
+        if comps:
+            comps[-1] = 1.0  # alpha is the last channel
+        fg.setComponents(comps)
+        view.setForeGroundColor(fg)
+        diag["fg_components"] = comps
+    except Exception as e:  # noqa: BLE001
+        diag["fg_error"] = f"{type(e).__name__}: {e}"
+
+    # Ensure a brush preset is active.
+    try:
+        cur = view.currentBrushPreset()
+        if cur is None:
+            presets = app.resources("preset")
+            name = next((k for k in presets if "Basic" in k), None) or \
+                (next(iter(presets)) if presets else None)
+            if name:
+                view.setCurrentBrushPreset(presets[name])
+                cur = view.currentBrushPreset()
+        diag["preset"] = cur.name() if cur is not None else None
+    except Exception as e:  # noqa: BLE001
+        diag["preset_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        node = doc.activeNode()
+        diag["active_node"] = node.name() if node is not None else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    canvas = _find_canvas_widget()
+    if canvas is None:
+        raise RuntimeError("canvas widget not found")
+    w, h = canvas.width(), canvas.height()
+    pts = args.get("points") or _gen_jitter_arc(w, h, int(args.get("n", 140)))
+    interval = int(args.get("interval_ms", 12))
+
+    def mk(kind, x, y, button, buttons):
+        p = QPointF(float(x), float(y))
+        return QMouseEvent(kind, p, p, button, buttons, _nomod)
+
+    # The input manager only binds to a canvas on FocusIn. We launched without
+    # focus, so the canvas was never bound — synthesize a FocusIn (a non-mouse
+    # reason, else KisInputManager "eats" the first stroke) to bind it without
+    # actually stealing OS focus.
+    QApplication.sendEvent(canvas, QFocusEvent(_focusin, _otherreason))
+
+    # Synchronous delivery through the input-manager event filter.
+    QApplication.sendEvent(canvas, mk(_press, pts[0][0], pts[0][1], _LB, _LB))
+    state = {"i": 1}
+    timer = QTimer()
+
+    def tick():
+        i = state["i"]
+        if i < len(pts):
+            x, y = pts[i]
+            QApplication.sendEvent(canvas, mk(_move, x, y, _NB, _LB))
+            state["i"] = i + 1
+        else:
+            timer.stop()
+            xe, ye = pts[-1]
+            QApplication.sendEvent(canvas, mk(_release, xe, ye, _LB, _NB))
+            doc.refreshProjection()
+            _active_stroke.pop("timer", None)
+
+    timer.timeout.connect(tick)
+    timer.setInterval(interval)
+    timer.start()
+    _active_stroke["timer"] = timer
+    diag.update({"canvas": [w, h], "points": len(pts), "interval_ms": interval,
+                 "duration_ms": interval * len(pts)})
+    return diag
 
 
 COMMANDS = {
@@ -207,6 +408,9 @@ COMMANDS = {
     "document.save": _cmd_document_save,
     "layer.add": _cmd_layer_add,
     "shape.draw": _cmd_shape_draw,
+    "tool.brush_stroke": _cmd_brush_stroke,
+    "app.list_windows": _cmd_list_windows,
+    "app.close_dialogs": _cmd_close_dialogs,
     "edit.undo": _cmd_edit_undo,
 }
 
