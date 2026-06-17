@@ -43,14 +43,38 @@ interpreter, where you can't assume external PyPI packages are present.
 ## Install (dev)
 
 ```bash
-# external half
+# external half (or just run `PYTHONPATH=src python -m nulpaint.cli ...` uninstalled)
 pip install -e '.[mcp,voice,dev]'
 
-# in-Krita half — symlink the plugin into Krita's resource folder
-ln -s "$PWD/krita_plugin/nulpaint"        ~/.local/share/krita/pykrita/nulpaint
-ln -s "$PWD/krita_plugin/nulpaint.desktop" ~/.local/share/krita/pykrita/nulpaint.desktop
-# then enable: Krita → Settings → Configure Krita → Python Plugin Manager → NulPaint
+# in-Krita half — symlink the plugin into Krita's resource folder.
+# NOTE the .desktop link MUST use the kritapykrita_ prefix; Krita's plugin
+# scanner only picks up files named kritapykrita_<library>.desktop.
+ln -s "$PWD/krita_plugin/nulpaint" ~/.local/share/krita/pykrita/nulpaint
+ln -s "$PWD/krita_plugin/nulpaint.desktop" \
+      ~/.local/share/krita/pykrita/kritapykrita_nulpaint.desktop
+
+# enable it (either the GUI or the config file):
+#   GUI:  Krita → Settings → Configure Krita → Python Plugin Manager → NulPaint
+#   CLI:  kwriteconfig6 --file kritarc --group python --key enable_nulpaint true
 ```
+
+> The Qt6/KF6 fork runs plugins under **PyQt6** (scoped enums). The in-Krita
+> half imports PyQt6 and falls back to PyQt5, so it works on either build.
+
+## CLI
+
+```bash
+nulpaint launch --no-focus   # launch the fork without it stealing window focus
+nulpaint ping                # round-trip the in-Krita socket → "pong"
+nulpaint demo                # create a 1080Land doc + draw circles & squares
+nulpaint info                # active document info
+nulpaint call document.info  # send any bridge command (--args '{"k": v}')
+nulpaint no-focus-rule remove # tear the KWin focus rule back down
+```
+
+`--no-focus` installs a persistent KWin window rule (focus-stealing-prevention =
+Extreme, scoped to the `krita` window class) on KDE — Krita has no such launch
+flag and on Wayland focus is the compositor's call, not the app's.
 
 ## Layout
 

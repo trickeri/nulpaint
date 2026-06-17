@@ -77,5 +77,17 @@ class BridgeClient:
     def active_document(self) -> Any:
         return self.call("document.info")
 
+    def create_document(self, width: int, height: int, name: str = "Untitled",
+                        resolution: float = 72.0) -> Any:
+        return self.call("document.create", width=width, height=height,
+                         name=name, resolution=resolution)
+
+    def draw_shapes(self, shape: str, color: list[int], items: list[dict],
+                    layer: str) -> Any:
+        return self.call("shape.draw", shape=shape, color=color, items=items, layer=layer)
+
+    def save_document(self, path: str | None = None) -> Any:
+        return self.call("document.save", **({"path": path} if path else {}))
+
     def undo(self) -> Any:
         return self.call("edit.undo")

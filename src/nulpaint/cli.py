@@ -1,0 +1,256 @@
+"""NulPaint command-line entry point.
+
+A thin operator/dev front-end over the bridge:
+
+  nulpaint launch [--no-focus]   launch the forked Krita (optionally without
+                                 stealing window focus — see below)
+  nulpaint ping                  round-trip the in-Krita socket server
+  nulpaint info                  print the active document's info
+  nulpaint demo [--preset NAME]  create a doc + draw circles/squares (smoke test)
+  nulpaint call CMD [--args J]   send an arbitrary bridge command
+  nulpaint no-focus-rule add|remove   manage the KWin focus rule directly
+
+Focus stealing
+--------------
+Krita has no "don't activate me" launch flag, and on KDE Wayland focus is the
+window manager's call, not the app's. So ``--no-focus`` installs a persistent
+KWin window rule (focus-stealing-prevention = Extreme) scoped to Krita's window
+class, then asks KWin to reload. Krita then opens in the background without
+yanking focus from whatever you're doing. Remove it any time with
+``nulpaint no-focus-rule remove``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from .bridge import BridgeClient, BridgeError
+
+# --- document presets -------------------------------------------------------
+# Krita's Python API has no "named built-in preset" call, so a preset here is
+# just (width, height, resolution-ppi). "1080Land" == 1080p landscape.
+PRESETS: dict[str, tuple[int, int, float]] = {
+    "1080Land": (1920, 1080, 72.0),
+    "1080Port": (1080, 1920, 72.0),
+    "4KLand": (3840, 2160, 72.0),
+    "Square": (1080, 1080, 72.0),
+}
+
+# --- KWin no-focus rule -----------------------------------------------------
+_KWIN_FILE = "kwinrulesrc"
+# Fixed group id so applying the rule is idempotent across runs.
+_RULE_ID = "{f5a9c7e1-3b2d-4e8a-9f10-7c6b5a4d3e2f}"
+_RULE_KEYS = {
+    "Description": "nulpaint: krita no focus steal",
+    "wmclass": "krita",
+    "wmclassmatch": "1",   # 1 = exact match
+    "fsplevel": "4",        # 4 = Extreme focus-stealing prevention
+    "fsplevelrule": "2",    # 2 = Force
+}
+
+
+def _krita_binary(explicit: str | None) -> str:
+    """Resolve the Krita binary, preferring the local fork install."""
+    if explicit:
+        return explicit
+    env = os.environ.get("NULPAINT_KRITA")
+    if env:
+        return env
+    fork = Path.home() / ".local/bin/krita"
+    if fork.exists():
+        return str(fork)
+    found = shutil.which("krita")
+    if not found:
+        sys.exit("nulpaint: cannot find a 'krita' binary (set NULPAINT_KRITA or --krita)")
+    return found
+
+
+def _kreadconfig(group: str, key: str) -> str:
+    try:
+        out = subprocess.run(
+            ["kreadconfig6", "--file", _KWIN_FILE, "--group", group, "--key", key],
+            capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return ""
+
+
+def _kwriteconfig(group: str, key: str, value: str) -> None:
+    subprocess.run(
+        ["kwriteconfig6", "--file", _KWIN_FILE, "--group", group, "--key", key, value],
+        check=True)
+
+
+def _kwin_reconfigure() -> None:
+    for tool in ("qdbus6", "qdbus"):
+        if shutil.which(tool):
+            subprocess.run([tool, "org.kde.KWin", "/KWin", "org.kde.KWin.reconfigure"],
+                           check=False)
+            return
+
+
+def add_no_focus_rule() -> None:
+    """Install (idempotently) the KWin rule that stops Krita stealing focus."""
+    if not shutil.which("kwriteconfig6"):
+        sys.exit("nulpaint: kwriteconfig6 not found — is this a KDE session?")
+    ids = [r for r in _kreadconfig("General", "rules").split(",") if r]
+    if _RULE_ID not in ids:
+        ids.append(_RULE_ID)
+        _kwriteconfig("General", "rules", ",".join(ids))
+        _kwriteconfig("General", "count", str(len(ids)))
+    for key, value in _RULE_KEYS.items():
+        _kwriteconfig(_RULE_ID, key, value)
+    _kwin_reconfigure()
+
+
+def remove_no_focus_rule() -> None:
+    ids = [r for r in _kreadconfig("General", "rules").split(",") if r and r != _RULE_ID]
+    _kwriteconfig("General", "rules", ",".join(ids))
+    _kwriteconfig("General", "count", str(len(ids)))
+    subprocess.run(["kwriteconfig6", "--file", _KWIN_FILE, "--group", _RULE_ID, "--delete-group"],
+                   check=False)
+    _kwin_reconfigure()
+
+
+def _connect(timeout: float) -> BridgeClient:
+    """Connect to the in-Krita server, retrying until Krita is ready."""
+    deadline = time.monotonic() + timeout
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        c = BridgeClient()
+        try:
+            c.connect()
+            return c
+        except OSError as e:  # Krita not up / plugin not serving yet
+            last = e
+            time.sleep(0.4)
+    sys.exit(f"nulpaint: could not reach Krita bridge within {timeout:g}s ({last})")
+
+
+# --- subcommands ------------------------------------------------------------
+def cmd_launch(a: argparse.Namespace) -> None:
+    if a.no_focus:
+        add_no_focus_rule()
+        print("nulpaint: KWin no-focus rule active for 'krita'")
+    binary = _krita_binary(a.krita)
+    argv = [binary] + (["--nosplash"] if a.no_splash else [])
+    subprocess.Popen(argv, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"nulpaint: launched {binary} (pid detached)")
+
+
+def cmd_ping(_a: argparse.Namespace) -> None:
+    with _connect(_a.wait) as c:
+        print(c.ping())
+
+
+def cmd_info(_a: argparse.Namespace) -> None:
+    with _connect(_a.wait) as c:
+        print(json.dumps(c.active_document(), indent=2))
+
+
+def cmd_save(a: argparse.Namespace) -> None:
+    with _connect(a.wait) as c:
+        print(json.dumps(c.save_document(a.path), indent=2))
+
+
+def cmd_call(a: argparse.Namespace) -> None:
+    args = json.loads(a.args) if a.args else {}
+    with _connect(a.wait) as c:
+        print(json.dumps(c.call(a.cmd_name, **args), indent=2))
+
+
+def cmd_no_focus_rule(a: argparse.Namespace) -> None:
+    if a.action == "add":
+        add_no_focus_rule()
+        print("nulpaint: no-focus rule added")
+    else:
+        remove_no_focus_rule()
+        print("nulpaint: no-focus rule removed")
+
+
+# Demo shape layouts (bounding boxes on a 1920x1080 canvas; scaled to preset).
+_CIRCLES = [(160, 180, 200, 200), (520, 120, 150, 150), (900, 300, 260, 260),
+            (380, 640, 180, 180), (1300, 520, 220, 220)]
+_SQUARES = [(1480, 160, 180, 180), (300, 380, 140, 140), (760, 720, 200, 200),
+            (1120, 120, 150, 150), (1580, 760, 160, 160)]
+
+
+def _scale_items(boxes, sx, sy):
+    return [{"x": int(x * sx), "y": int(y * sy), "w": int(w * sx), "h": int(h * sy)}
+            for (x, y, w, h) in boxes]
+
+
+def cmd_demo(a: argparse.Namespace) -> None:
+    if a.preset not in PRESETS:
+        sys.exit(f"nulpaint: unknown preset {a.preset!r} (have: {', '.join(PRESETS)})")
+    w, h, res = PRESETS[a.preset]
+    sx, sy = w / 1920.0, h / 1080.0
+    with _connect(a.wait) as c:
+        print("ping:", c.ping())
+        doc = c.create_document(w, h, name=a.preset, resolution=res)
+        print("document:", json.dumps(doc))
+        circ = c.draw_shapes("ellipse", [40, 120, 255, 255],
+                             _scale_items(_CIRCLES, sx, sy), layer="Circles")
+        print("circles:", json.dumps(circ))
+        sq = c.draw_shapes("rectangle", [255, 140, 30, 255],
+                           _scale_items(_SQUARES, sx, sy), layer="Squares")
+        print("squares:", json.dumps(sq))
+    print("nulpaint: demo complete")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="nulpaint", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--wait", type=float, default=20.0,
+                   help="seconds to wait for the Krita bridge (default 20)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    pl = sub.add_parser("launch", help="launch the forked Krita")
+    pl.add_argument("--no-focus", action="store_true",
+                    help="install a KWin rule so Krita won't steal focus")
+    pl.add_argument("--no-splash", action="store_true", help="suppress the splash screen")
+    pl.add_argument("--krita", help="path to the krita binary (default: ~/.local/bin/krita)")
+    pl.set_defaults(func=cmd_launch)
+
+    sub.add_parser("ping", help="ping the in-Krita server").set_defaults(func=cmd_ping)
+    sub.add_parser("info", help="print active document info").set_defaults(func=cmd_info)
+
+    ps = sub.add_parser("save", help="save the active document")
+    ps.add_argument("path", nargs="?", help="destination file (e.g. foo.kra); "
+                    "omit to re-save to the existing path")
+    ps.set_defaults(func=cmd_save)
+
+    pc = sub.add_parser("call", help="send an arbitrary bridge command")
+    pc.add_argument("cmd_name", help="command name, e.g. document.info")
+    pc.add_argument("--args", help="JSON object of command args")
+    pc.set_defaults(func=cmd_call)
+
+    pd = sub.add_parser("demo", help="create a doc + draw circles/squares")
+    pd.add_argument("--preset", default="1080Land", help="document preset (default 1080Land)")
+    pd.set_defaults(func=cmd_demo)
+
+    pn = sub.add_parser("no-focus-rule", help="manage the KWin no-focus rule")
+    pn.add_argument("action", choices=["add", "remove"])
+    pn.set_defaults(func=cmd_no_focus_rule)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except BridgeError as e:
+        sys.exit(f"nulpaint: bridge error — is Krita running with the plugin enabled? ({e})")
+
+
+if __name__ == "__main__":
+    main()
