@@ -7,9 +7,12 @@ branch), in service of a Photoshop-style workflow.
 
 - [ ] Confirm Krita's Python API surface for the commands we want
       (`layer.*`, `select.*`, `image.*`). Use Scripter to probe live.
-- [ ] Verify a background thread can `socket.bind` inside Krita without
+- [x] Verify a background thread can `socket.bind` inside Krita without
       tripping its event loop, and that the GUI-thread dispatch
       (`pyqtSignal` + `Qt.QueuedConnection`) actually serializes correctly.
+      Confirmed 2026-06-16 — background `socket.listen` + `QueuedConnection`
+      dispatch works. NB: the Qt6 fork runs plugins under **PyQt6** (scoped
+      enums), not PyQt5.
 - [ ] Decide which Photoshop-parity commands are reachable from Python vs.
       which need a C++ patch in the fork (adjustment layers, PS selection
       behavior, layer styles).
@@ -19,8 +22,9 @@ branch), in service of a Photoshop-style workflow.
 - [x] Wire protocol (newline JSON) — `config.py` + plugin mirror it.
 - [x] In-Krita socket server + GUI-thread dispatcher.
 - [x] External `BridgeClient`.
-- [ ] End-to-end smoke test: external `ping` → Krita → `pong`.
-- [ ] Flesh out the command table (layers, selections, transforms).
+- [x] End-to-end smoke test: external `ping` → Krita → `pong` (2026-06-16).
+- [~] Flesh out the command table — done: `document.create`, `document.save`,
+      `layer.add`, `shape.draw`. Still to add: selections, transforms.
 
 ## Phase 2 — Fast voice path
 
