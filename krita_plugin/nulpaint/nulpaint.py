@@ -209,6 +209,21 @@ def _cmd_document_save(args):
     return {"ok": bool(ok), "fileName": doc.fileName(), "modified": doc.modified()}
 
 
+def _cmd_grab_canvas(args):
+    """Grab the canvas widget (incl. live tool decorations/preview) to a PNG.
+
+    Unlike document.save this captures the on-screen canvas overlay, so it can
+    show transient previews (e.g. the Flash Smooth in-progress line).
+    """
+    canvas = _find_canvas_widget()
+    if canvas is None:
+        raise RuntimeError("canvas widget not found")
+    path = args.get("path", "/tmp/nulpaint-canvas.png")
+    pix = canvas.grab()
+    ok = pix.save(path)
+    return {"ok": bool(ok), "path": path, "size": [pix.width(), pix.height()]}
+
+
 def _cmd_list_windows(_args):
     """List visible top-level widgets — handy for spotting blocking dialogs."""
     try:
@@ -411,6 +426,7 @@ COMMANDS = {
     "tool.brush_stroke": _cmd_brush_stroke,
     "app.list_windows": _cmd_list_windows,
     "app.close_dialogs": _cmd_close_dialogs,
+    "app.grab_canvas": _cmd_grab_canvas,
     "edit.undo": _cmd_edit_undo,
 }
 
