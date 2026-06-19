@@ -206,6 +206,58 @@ def cmd_demo(a: argparse.Namespace) -> None:
     print("nulpaint: demo complete")
 
 
+def cmd_select_subject(a: argparse.Namespace) -> None:
+    from .vision import select_subject
+    kind = "object" if a.object else "person"
+    with _connect(a.wait) as c:
+        res = select_subject(c, kind)
+    print(f"nulpaint: selected {res['kind']} via {res['service']} "
+          f"({res['w']}x{res['h']})")
+
+
+def cmd_inpaint(a: argparse.Namespace) -> None:
+    from .generate import inpaint
+    extra = {} if a.img_cfg is None else {"img_cfg": a.img_cfg}
+    with _connect(a.wait) as c:
+        res = inpaint(c, a.prompt, negative=a.negative, model=a.model,
+                      steps=a.steps, cfg=a.cfg, strength=a.strength,
+                      seed=a.seed, pad=a.pad, **extra)
+    print(f"nulpaint: inpainted [{res['model']}] {res['w']}x{res['h']} "
+          f"@({res['x']},{res['y']})")
+
+
+def cmd_outpaint(a: argparse.Namespace) -> None:
+    from .generate import outpaint
+    extra = {} if a.img_cfg is None else {"img_cfg": a.img_cfg}
+    with _connect(a.wait) as c:
+        res = outpaint(c, a.prompt, negative=a.negative, model=a.model,
+                       pixels=a.pixels, sides=a.sides, steps=a.steps,
+                       cfg=a.cfg, strength=a.strength, seed=a.seed, **extra)
+    print(f"nulpaint: outpainted [{res['model']}] -> {res['width']}x{res['height']} "
+          f"(+{res['pixels']}px {','.join(res['sides'])})")
+
+
+def cmd_style(a: argparse.Namespace) -> None:
+    from .generate import style
+    with _connect(a.wait) as c:
+        res = style(c, a.prompt, negative=a.negative, model=a.model,
+                    strength=a.strength, steps=a.steps, cfg=a.cfg, seed=a.seed)
+    print(f"nulpaint: restyled [{res['model']}] {res['scope']} "
+          f"{res['w']}x{res['h']} (strength {res['strength']})")
+
+
+def _add_diffusion_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("prompt", help="text prompt")
+    p.add_argument("-n", "--negative", default="", help="negative prompt")
+    p.add_argument("--model", default=None, help="sd15 (default) | sdxl")
+    p.add_argument("--steps", type=int, default=20)
+    p.add_argument("--cfg", type=float, default=7.0, help="cfg scale (prompt strength)")
+    p.add_argument("--img-cfg", type=float, default=None, dest="img_cfg",
+                   help="image guidance: low (~1.5)=bold replace, high (~cfg)=seamless fill")
+    p.add_argument("--strength", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=-1, help="-1 = random")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nulpaint", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -240,6 +292,36 @@ def build_parser() -> argparse.ArgumentParser:
     pn = sub.add_parser("no-focus-rule", help="manage the KWin no-focus rule")
     pn.add_argument("action", choices=["add", "remove"])
     pn.set_defaults(func=cmd_no_focus_rule)
+
+    pss = sub.add_parser("select-subject",
+                         help="select the subject via the matte/seg services")
+    pss.add_argument("--object", action="store_true",
+                     help="arbitrary object (segmodel) instead of a person (mattemodel)")
+    pss.set_defaults(func=cmd_select_subject)
+
+    pip = sub.add_parser("inpaint", help="generative fill the current selection")
+    _add_diffusion_args(pip)
+    pip.add_argument("--pad", type=float, default=0.25,
+                     help="context margin around the selection (fraction)")
+    pip.set_defaults(func=cmd_inpaint)
+
+    pop = sub.add_parser("outpaint", help="extend the canvas with generated content")
+    _add_diffusion_args(pop)
+    pop.add_argument("--pixels", type=int, default=256, help="border to add (px)")
+    pop.add_argument("--sides", default="all",
+                     help="'all' or comma list: left,right,top,bottom")
+    pop.set_defaults(func=cmd_outpaint)
+
+    pst = sub.add_parser("style", help="restyle the selection (or whole layer) via img2img")
+    pst.add_argument("prompt", help="style prompt, e.g. 'watercolor painting'")
+    pst.add_argument("-n", "--negative", default="")
+    pst.add_argument("--model", default="sdxl", help="sdxl (default) | sd15")
+    pst.add_argument("--strength", type=float, default=0.55,
+                     help="transform amount: 0.3 subtle .. 0.8 strong (default 0.55)")
+    pst.add_argument("--steps", type=int, default=24)
+    pst.add_argument("--cfg", type=float, default=7.0)
+    pst.add_argument("--seed", type=int, default=-1)
+    pst.set_defaults(func=cmd_style)
 
     return p
 

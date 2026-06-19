@@ -13,6 +13,7 @@ Wire protocol (must match src/nulpaint/config.py):
   response: {"id": int, "ok": bool, "result": any, "error": str|null}\n
 """
 
+import base64
 import json
 import socket
 import threading
@@ -416,6 +417,184 @@ def _cmd_brush_stroke(args):
     return diag
 
 
+# --- inpaint I/O (pixels in/out for the external sd.cpp orchestrator) --------
+# The external half pulls a layer region + the selection mask, runs the
+# diffusion inpaint, composites, then writes the region back. These four
+# commands are the only Krita-side surface that needs; everything model-related
+# lives outside Krita. All transfer images as base64 PNG over the JSON wire.
+def _qt_imaging():
+    """The QtGui/QtCore image classes we need — PyQt6 with a PyQt5 fallback.
+    The QIODevice write-mode flag's enum path differs across the two bindings."""
+    try:
+        from PyQt6.QtGui import QImage
+        from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
+        return (QImage, QByteArray, QBuffer, QIODevice.OpenModeFlag.WriteOnly,
+                QImage.Format.Format_ARGB32, QImage.Format.Format_Grayscale8)
+    except ImportError:  # pragma: no cover — Qt5 fallback
+        from PyQt5.QtGui import QImage
+        from PyQt5.QtCore import QByteArray, QBuffer, QIODevice
+        return (QImage, QByteArray, QBuffer, QIODevice.WriteOnly,
+                QImage.Format_ARGB32, QImage.Format_Grayscale8)
+
+
+def _png_b64(img, QBuffer, write_only):
+    """Encode a QImage to a base64 PNG string."""
+    buf = QBuffer()
+    buf.open(write_only)
+    img.save(buf, "PNG")
+    data = bytes(buf.data())
+    buf.close()
+    return base64.b64encode(data).decode("ascii")
+
+
+def _require_rgba8(doc):
+    """Pixel I/O below assumes 8-bit RGBA byte order (ARGB32 ⇆ BGRA). Guard it."""
+    if doc.colorModel() != "RGBA" or doc.colorDepth() != "U8":
+        raise RuntimeError("inpaint v1 needs an 8-bit RGBA document; got "
+                           f"{doc.colorModel()}/{doc.colorDepth()}")
+
+
+def _target_node(doc, name=None):
+    node = doc.nodeByName(name) if name else doc.activeNode()
+    if node is None:
+        raise RuntimeError(f"layer not found: {name!r}" if name else "no active layer")
+    return node
+
+
+def _cmd_selection_info(_args):
+    """Active selection's bounding box in canvas px, or the full canvas if none."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    sel = doc.selection()
+    if sel is None:
+        return {"hasSelection": False,
+                "bounds": {"x": 0, "y": 0, "w": doc.width(), "h": doc.height()}}
+    return {"hasSelection": True,
+            "bounds": {"x": sel.x(), "y": sel.y(), "w": sel.width(), "h": sel.height()}}
+
+
+def _cmd_layer_get_region(args):
+    """Base64 PNG (RGBA) of a layer region — the inpaint context image.
+    args: x, y, w, h (canvas px); layer (name, default = active node)."""
+    QImage, _QBA, QBuffer, write_only, fmt_argb, _ = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    _require_rgba8(doc)
+    node = _target_node(doc, args.get("layer"))
+    x, y, w, h = int(args["x"]), int(args["y"]), int(args["w"]), int(args["h"])
+    raw = bytes(node.pixelData(x, y, w, h))          # BGRA, tightly packed
+    img = QImage(raw, w, h, fmt_argb).copy()         # copy() detaches from raw
+    return {"x": x, "y": y, "w": w, "h": h,
+            "png_b64": _png_b64(img, QBuffer, write_only)}
+
+
+def _cmd_selection_mask_region(args):
+    """Base64 PNG (grayscale, white = inpaint here) of the selection over a region.
+    No selection ⇒ all-white mask (whole region editable). args: x, y, w, h."""
+    QImage, _QBA, QBuffer, write_only, _, fmt_gray = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    x, y, w, h = int(args["x"]), int(args["y"]), int(args["w"]), int(args["h"])
+    sel = doc.selection()
+    if sel is None:
+        img = QImage(w, h, fmt_gray)
+        img.fill(255)
+    else:
+        raw = bytes(sel.pixelData(x, y, w, h))       # 1 byte/px, 0..255
+        img = QImage(raw, w, h, w, fmt_gray).copy()
+    return {"x": x, "y": y, "w": w, "h": h,
+            "png_b64": _png_b64(img, QBuffer, write_only)}
+
+
+def _cmd_layer_set_region(args):
+    """Write an RGBA image (base64 PNG) onto a layer at an offset — the result.
+    args: x, y, png_b64; layer (name, default active). w/h come from the image."""
+    QImage, QByteArray, _QBuf, _wo, fmt_argb, _ = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    _require_rgba8(doc)
+    node = _target_node(doc, args.get("layer"))
+    x, y = int(args["x"]), int(args["y"])
+    img = QImage()
+    if not img.loadFromData(base64.b64decode(args["png_b64"]), "PNG"):
+        raise RuntimeError("could not decode PNG payload")
+    img = img.convertToFormat(fmt_argb)
+    w, h = img.width(), img.height()
+    n = img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount()
+    ptr = img.constBits()
+    ptr.setsize(n)
+    node.setPixelData(QByteArray(bytes(ptr)), x, y, w, h)
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"layer": node.name(), "x": x, "y": y, "w": w, "h": h}
+
+
+# --- subject-select (mask from a mattemodel/segmodel service -> selection) ---
+def _cmd_image_get(_args):
+    """Base64 PNG of the merged visible image (projection) — the matte input."""
+    QImage, _QBA, QBuffer, write_only, _fa, _fg = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    w, h = doc.width(), doc.height()
+    img = doc.projection(0, 0, w, h)
+    if img is None or img.isNull():
+        raise RuntimeError("projection unavailable")
+    return {"w": w, "h": h, "png_b64": _png_b64(img, QBuffer, write_only)}
+
+
+def _cmd_image_extend(args):
+    """Grow the canvas for outpainting; existing content keeps its pixels, the new
+    border is transparent. args: left, top, right, bottom (px). Returns new size."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    l, t = int(args.get("left", 0)), int(args.get("top", 0))
+    r, b = int(args.get("right", 0)), int(args.get("bottom", 0))
+    w, h = doc.width(), doc.height()
+    # resizeImage(x, y, w, h): the new image's top-left sits at (x, y) in current
+    # coords, so (-l, -t) shifts existing content to (l, t) and adds the border.
+    doc.resizeImage(-l, -t, w + l + r, h + t + b)
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"width": doc.width(), "height": doc.height(),
+            "offset_x": l, "offset_y": t, "orig_w": w, "orig_h": h}
+
+
+def _cmd_selection_set_from_mask(args):
+    """Set the document selection from a grayscale mask (base64 PNG, white=selected).
+    args: png_b64; x, y (offset, default 0). Mask size = the image's size."""
+    from krita import Selection  # type: ignore
+    QImage, QByteArray, _QBuf, _wo, _fa, fmt_gray = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    img = QImage()
+    if not img.loadFromData(base64.b64decode(args["png_b64"]), "PNG"):
+        raise RuntimeError("could not decode mask PNG")
+    img = img.convertToFormat(fmt_gray)
+    w, h = img.width(), img.height()
+    x, y = int(args.get("x", 0)), int(args.get("y", 0))
+
+    # Tightly pack to w*h bytes (Grayscale8 scanlines are 4-byte aligned).
+    n = img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount()
+    bits = img.constBits()
+    bits.setsize(n)
+    buf = bytes(bits)
+    bpl = img.bytesPerLine()
+    packed = buf if bpl == w else b"".join(buf[r * bpl:r * bpl + w] for r in range(h))
+
+    sel = Selection()
+    sel.setPixelData(QByteArray(packed), x, y, w, h)
+    doc.setSelection(sel)
+    doc.refreshProjection()
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
 COMMANDS = {
     "ping": _cmd_ping,
     "document.info": _cmd_document_info,
@@ -428,6 +607,13 @@ COMMANDS = {
     "app.close_dialogs": _cmd_close_dialogs,
     "app.grab_canvas": _cmd_grab_canvas,
     "edit.undo": _cmd_edit_undo,
+    "selection.info": _cmd_selection_info,
+    "layer.get_region": _cmd_layer_get_region,
+    "selection.mask_region": _cmd_selection_mask_region,
+    "layer.set_region": _cmd_layer_set_region,
+    "image.get": _cmd_image_get,
+    "image.extend": _cmd_image_extend,
+    "selection.set_from_mask": _cmd_selection_set_from_mask,
 }
 
 
