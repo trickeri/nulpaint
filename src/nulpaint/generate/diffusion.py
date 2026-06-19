@@ -199,13 +199,18 @@ def control(client: BridgeClient, prompt: str, *, kind: str = "canny",
     info = client.call("document.info")
     W, H = info["width"], info["height"]
 
-    if control_image:
-        ctrl = Image.open(control_image).convert("RGB")
-    elif kind == "canny":
-        ctrl = _canny(_b64_to_img(client.call("image.get")["png_b64"]))
+    # Source image for the control map: a provided reference, else the canvas.
+    src = (Image.open(control_image).convert("RGB") if control_image
+           else _b64_to_img(client.call("image.get")["png_b64"]).convert("RGB"))
+    if kind == "canny":
+        ctrl = _canny(src)
+    elif kind == "openpose":
+        import numpy as np
+        from ..vision.pose import pose_skeleton
+        skel = pose_skeleton(np.ascontiguousarray(np.asarray(src)[:, :, ::-1]))  # RGB->BGR
+        ctrl = Image.fromarray(skel[:, :, ::-1])  # BGR->RGB
     else:
-        raise RuntimeError(f"{kind} needs a control map via --control-image "
-                           "(e.g. an OpenPose skeleton); none provided")
+        raise RuntimeError(f"unhandled control kind {kind!r}")
 
     ww, hh = _work_size(W, H, SD_NATIVE.get(model, 512))
     p = f"{prompt} {_lora_tokens(lora)}".strip() if lora else prompt
