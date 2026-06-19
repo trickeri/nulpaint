@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# nulpaint launcher — runs the CLI via the generate venv (Pillow/numpy/opencv/
+# onnxruntime) with src on PYTHONPATH, so you can just `nulpaint <verb> …`.
+# Symlink onto PATH:  ln -s "$PWD/nulpaint" ~/.local/bin/nulpaint
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY="$HERE/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3)"   # fall back to system python
+exec env PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m nulpaint.cli "$@"
