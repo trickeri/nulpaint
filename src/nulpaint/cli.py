@@ -221,7 +221,7 @@ def cmd_inpaint(a: argparse.Namespace) -> None:
     with _connect(a.wait) as c:
         res = inpaint(c, a.prompt, negative=a.negative, model=a.model,
                       steps=a.steps, cfg=a.cfg, strength=a.strength,
-                      seed=a.seed, pad=a.pad, **extra)
+                      seed=a.seed, pad=a.pad, lora=a.lora, **extra)
     print(f"nulpaint: inpainted [{res['model']}] {res['w']}x{res['h']} "
           f"@({res['x']},{res['y']})")
 
@@ -232,7 +232,7 @@ def cmd_outpaint(a: argparse.Namespace) -> None:
     with _connect(a.wait) as c:
         res = outpaint(c, a.prompt, negative=a.negative, model=a.model,
                        pixels=a.pixels, sides=a.sides, steps=a.steps,
-                       cfg=a.cfg, strength=a.strength, seed=a.seed, **extra)
+                       cfg=a.cfg, strength=a.strength, seed=a.seed, lora=a.lora, **extra)
     print(f"nulpaint: outpainted [{res['model']}] -> {res['width']}x{res['height']} "
           f"(+{res['pixels']}px {','.join(res['sides'])})")
 
@@ -241,9 +241,21 @@ def cmd_style(a: argparse.Namespace) -> None:
     from .generate import style
     with _connect(a.wait) as c:
         res = style(c, a.prompt, negative=a.negative, model=a.model,
-                    strength=a.strength, steps=a.steps, cfg=a.cfg, seed=a.seed)
+                    strength=a.strength, steps=a.steps, cfg=a.cfg, seed=a.seed,
+                    lora=a.lora)
     print(f"nulpaint: restyled [{res['model']}] {res['scope']} "
           f"{res['w']}x{res['h']} (strength {res['strength']})")
+
+
+def cmd_control(a: argparse.Namespace) -> None:
+    from .generate import control
+    with _connect(a.wait) as c:
+        res = control(c, a.prompt, kind=a.kind, control_image=a.control_image,
+                      model=a.model, control_strength=a.control_strength,
+                      steps=a.steps, cfg=a.cfg, seed=a.seed, negative=a.negative,
+                      lora=a.lora)
+    print(f"nulpaint: {res['kind']} controlnet [{res['model']}] -> layer "
+          f"'{res['layer']}' ({res['w']}x{res['h']})")
 
 
 def _add_diffusion_args(p: argparse.ArgumentParser) -> None:
@@ -256,6 +268,8 @@ def _add_diffusion_args(p: argparse.ArgumentParser) -> None:
                    help="image guidance: low (~1.5)=bold replace, high (~cfg)=seamless fill")
     p.add_argument("--strength", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=-1, help="-1 = random")
+    p.add_argument("--lora", default="",
+                   help="LoRA(s) as name[:weight], comma-separated (files in models/loras/)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -321,7 +335,25 @@ def build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--steps", type=int, default=24)
     pst.add_argument("--cfg", type=float, default=7.0)
     pst.add_argument("--seed", type=int, default=-1)
+    pst.add_argument("--lora", default="",
+                     help="LoRA(s) as name[:weight], comma-separated (files in models/loras/)")
     pst.set_defaults(func=cmd_style)
+
+    pcn = sub.add_parser("control",
+                         help="ControlNet: generate following a structural map (canny/openpose)")
+    pcn.add_argument("prompt")
+    pcn.add_argument("--kind", default="canny", choices=["canny", "openpose"],
+                     help="canny (composition lock, from canvas) | openpose (repose)")
+    pcn.add_argument("--control-image", default=None, dest="control_image",
+                     help="control map file (required for openpose; a pose skeleton)")
+    pcn.add_argument("--control-strength", type=float, default=0.9, dest="control_strength")
+    pcn.add_argument("--model", default="sd15base", help="SD1.5 base for SD1.5 ControlNets")
+    pcn.add_argument("-n", "--negative", default="")
+    pcn.add_argument("--steps", type=int, default=24)
+    pcn.add_argument("--cfg", type=float, default=7.0)
+    pcn.add_argument("--seed", type=int, default=-1)
+    pcn.add_argument("--lora", default="", help="LoRA(s) as name[:weight], comma-separated")
+    pcn.set_defaults(func=cmd_control)
 
     return p
 

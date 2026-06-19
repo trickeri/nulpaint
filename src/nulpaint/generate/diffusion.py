@@ -18,7 +18,18 @@ from PIL import Image, ImageDraw
 
 from ..bridge import BridgeClient
 from ..config import (SDCLI_BIN, SD_MODELS, SD_DEFAULT_MODEL, SD_NATIVE,
-                      SD_IMG_CFG)
+                      SD_IMG_CFG, LORA_DIR, CONTROLNET_DIR, CONTROL_MODELS)
+
+
+def _lora_tokens(lora: str) -> str:
+    """'name' -> <lora:name:1.0>; 'name:0.7' -> <lora:name:0.7>; comma-separated."""
+    out = []
+    for part in (p.strip() for p in lora.split(",")):
+        if not part:
+            continue
+        name, _, w = part.partition(":")
+        out.append(f"<lora:{name}:{w or '1.0'}>")
+    return " ".join(out)
 
 
 def _b64_to_img(s: str) -> Image.Image:
@@ -48,6 +59,8 @@ def _run_sdcli(init_p, mask_p, out_p, prompt, negative, model_p, ww, hh,
            "-s", str(seed), "--sampling-method", "euler_a"]
     if img_cfg is not None:        # inpaint/edit-model image guidance only
         cmd += ["--img-cfg-scale", str(img_cfg)]
+    if os.path.isdir(LORA_DIR):    # LoRAs referenced as <lora:name:w> in the prompt
+        cmd += ["--lora-model-dir", LORA_DIR]
     if negative:
         cmd += ["-n", negative]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -57,10 +70,13 @@ def _run_sdcli(init_p, mask_p, out_p, prompt, negative, model_p, ww, hh,
 
 def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
               negative: str, model: str, steps: int, cfg: float,
-              strength: float, seed: int, img_cfg: float) -> Image.Image:
+              strength: float, seed: int, img_cfg: float,
+              lora: str = "") -> Image.Image:
     """init (RGBA) + mask (L, white=regen) at region resolution → composited RGBA."""
     if model not in SD_MODELS:
         raise RuntimeError(f"unknown model {model!r} (have: {', '.join(SD_MODELS)})")
+    if lora:
+        prompt = f"{prompt} {_lora_tokens(lora)}".strip()
     rw, rh = init_rgba.size
     ww, hh = _work_size(rw, rh, SD_NATIVE.get(model, 512))
     with tempfile.TemporaryDirectory() as td:
@@ -77,7 +93,7 @@ def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
 def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
             model: str | None = None, steps: int = 20, cfg: float = 7.0,
             strength: float = 1.0, seed: int = -1, pad: float = 0.25,
-            img_cfg: float = SD_IMG_CFG) -> dict:
+            img_cfg: float = SD_IMG_CFG, lora: str = "") -> dict:
     """Inpaint the current selection. `pad` adds context margin around the bbox."""
     model = model or SD_DEFAULT_MODEL
     sel = client.call("selection.info")
@@ -93,7 +109,7 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
     mask = _b64_to_img(client.call("selection.mask_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("L")
-    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg)
+    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora)
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))
     return {"mode": "inpaint", "model": model, "x": x0, "y": y0, "w": rw, "h": rh}
 
@@ -101,7 +117,7 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
              model: str | None = None, pixels: int = 256, sides: str = "all",
              steps: int = 20, cfg: float = 7.0, strength: float = 1.0,
-             seed: int = -1, img_cfg: float = SD_IMG_CFG) -> dict:
+             seed: int = -1, img_cfg: float = SD_IMG_CFG, lora: str = "") -> dict:
     """Extend the canvas and generate into the new border, using existing pixels
     as context. sides: 'all' or a comma list of left,right,top,bottom."""
     model = model or SD_DEFAULT_MODEL
@@ -121,7 +137,7 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
     # White everywhere, black over the original content rect (l,t,W,H) = keep it.
     mask = Image.new("L", (NW, NH), 255)
     ImageDraw.Draw(mask).rectangle([l, t, l + W - 1, t + H - 1], fill=0)
-    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg)
+    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora)
     client.call("layer.set_region", x=0, y=0, png_b64=_img_to_b64(out))
     return {"mode": "outpaint", "model": model, "width": NW, "height": NH,
             "pixels": pixels, "sides": sorted(want)}
@@ -129,7 +145,7 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 
 def style(client: BridgeClient, prompt: str, *, negative: str = "",
           model: str = "sdxl", strength: float = 0.55, steps: int = 24,
-          cfg: float = 7.0, seed: int = -1) -> dict:
+          cfg: float = 7.0, seed: int = -1, lora: str = "") -> dict:
     """Restyle via img2img — the selection if there is one, else the whole layer.
 
     `strength` is the transform amount: ~0.3 subtle, ~0.55 balanced, ~0.8 strong
@@ -150,7 +166,68 @@ def style(client: BridgeClient, prompt: str, *, negative: str = "",
         scope = "layer"
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed,
-                    img_cfg=None)   # base-model img2img: no inpaint image-guidance
+                    img_cfg=None, lora=lora)  # base-model img2img: no inpaint image-guidance
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))
     return {"mode": "style", "model": model, "scope": scope,
             "strength": strength, "x": x0, "y": y0, "w": rw, "h": rh}
+
+
+def _canny(img: Image.Image) -> Image.Image:
+    """Canny edge map (OpenCV if present, else a PIL fallback) for ControlNet."""
+    try:
+        import cv2, numpy as np
+        g = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        return Image.fromarray(cv2.Canny(g, 100, 200)).convert("RGB")
+    except ImportError:
+        from PIL import ImageFilter, ImageOps
+        return ImageOps.grayscale(img).filter(ImageFilter.FIND_EDGES).convert("RGB")
+
+
+def control(client: BridgeClient, prompt: str, *, kind: str = "canny",
+            control_image: str | None = None, model: str = "sd15base",
+            control_strength: float = 0.9, steps: int = 24, cfg: float = 7.0,
+            seed: int = -1, negative: str = "", lora: str = "") -> dict:
+    """Generate a new image conditioned on a structural control map, onto a new
+    layer (original preserved). kind: 'canny' (composition lock, map derived from
+    the canvas) or 'openpose' (repose — needs a skeleton via --control-image).
+    Uses SD1.5 ControlNets, so model defaults to sd15base."""
+    if kind not in CONTROL_MODELS:
+        raise RuntimeError(f"unknown control {kind!r} (have: {', '.join(CONTROL_MODELS)})")
+    cnet = os.path.join(CONTROLNET_DIR, CONTROL_MODELS[kind])
+    if not os.path.exists(cnet):
+        raise RuntimeError(f"ControlNet model missing: {cnet} — fetch it first")
+    info = client.call("document.info")
+    W, H = info["width"], info["height"]
+
+    if control_image:
+        ctrl = Image.open(control_image).convert("RGB")
+    elif kind == "canny":
+        ctrl = _canny(_b64_to_img(client.call("image.get")["png_b64"]))
+    else:
+        raise RuntimeError(f"{kind} needs a control map via --control-image "
+                           "(e.g. an OpenPose skeleton); none provided")
+
+    ww, hh = _work_size(W, H, SD_NATIVE.get(model, 512))
+    p = f"{prompt} {_lora_tokens(lora)}".strip() if lora else prompt
+    with tempfile.TemporaryDirectory() as td:
+        cp, op = os.path.join(td, "ctrl.png"), os.path.join(td, "out.png")
+        ctrl.resize((ww, hh), Image.LANCZOS).save(cp)
+        cmd = [SDCLI_BIN, "-M", "img_gen", "-m", SD_MODELS[model], "-p", p, "-o", op,
+               "-W", str(ww), "-H", str(hh), "--steps", str(steps),
+               "--cfg-scale", str(cfg), "-s", str(seed), "--sampling-method", "euler_a",
+               "--control-net", cnet, "--control-image", cp,
+               "--control-strength", str(control_strength)]
+        if negative:
+            cmd += ["-n", negative]
+        if os.path.isdir(LORA_DIR):
+            cmd += ["--lora-model-dir", LORA_DIR]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(op):
+            raise RuntimeError(f"sd-cli controlnet failed (exit {r.returncode}): {r.stderr[-600:]}")
+        result = Image.open(op).convert("RGBA").resize((W, H), Image.LANCZOS)
+
+    layer = f"nulpaint {kind}"
+    client.call("layer.add", name=layer)
+    client.call("layer.set_region", layer=layer, x=0, y=0, png_b64=_img_to_b64(result))
+    return {"mode": "control", "kind": kind, "model": model, "layer": layer,
+            "w": W, "h": H}

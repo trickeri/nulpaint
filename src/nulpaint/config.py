@@ -38,10 +38,24 @@ SDCLI_BIN = os.environ.get(
 SD_MODELS = {
     "sd15": os.path.join(_KRITA_ROOT, "models/sd-v1-5-inpainting.ckpt"),
     "sdxl": os.path.join(_KRITA_ROOT, "models/sd_xl_base_1.0.safetensors"),
+    # SD1.5 base — needed for the SD1.5 ControlNets (the inpaint sd15 won't do).
+    "sd15base": os.path.join(_KRITA_ROOT, "models/sd-v1-5-base-fp16.safetensors"),
 }
 SD_DEFAULT_MODEL = os.environ.get("SD_DEFAULT_MODEL", "sd15")
 # Native working resolution per model family (longest side, snapped to /64).
-SD_NATIVE = {"sd15": 512, "sdxl": 1024}
+SD_NATIVE = {"sd15": 512, "sdxl": 1024, "sd15base": 512}
 # Image-guidance for inpaint: lower => bolder prompt adherence (replace), higher
 # (≈cfg) => seamless content-aware fill. 1.5 follows the prompt while staying coherent.
 SD_IMG_CFG = float(os.environ.get("SD_IMG_CFG", "1.5"))
+
+# LoRAs: drop <name>.safetensors here, reference as <lora:name:weight> (or the
+# --lora flag). ControlNets: <name>.safetensors here, selected by --control.
+LORA_DIR = os.environ.get("NULPAINT_LORA_DIR", os.path.join(_KRITA_ROOT, "models/loras"))
+CONTROLNET_DIR = os.environ.get(
+    "NULPAINT_CONTROLNET_DIR", os.path.join(_KRITA_ROOT, "models/controlnet"))
+# ControlNet model filenames (in CONTROLNET_DIR). These are SD1.5 ControlNets, so
+# they pair with the sd15base model. canny=composition-lock, openpose=repose.
+CONTROL_MODELS = {
+    "canny": "control_v11p_sd15_canny_fp16.safetensors",
+    "openpose": "control_v11p_sd15_openpose_fp16.safetensors",
+}

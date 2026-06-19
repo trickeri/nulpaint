@@ -1,4 +1,4 @@
-"""Generative editing — inpaint/outpaint/style via stable-diffusion.cpp."""
-from .diffusion import inpaint, outpaint, style
+"""Generative editing — inpaint/outpaint/style/controlnet via stable-diffusion.cpp."""
+from .diffusion import inpaint, outpaint, style, control
 
-__all__ = ["inpaint", "outpaint", "style"]
+__all__ = ["inpaint", "outpaint", "style", "control"]
