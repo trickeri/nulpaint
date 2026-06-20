@@ -18,7 +18,14 @@ from PIL import Image, ImageDraw
 
 from ..bridge import BridgeClient
 from ..config import (SDCLI_BIN, SD_MODELS, SD_DEFAULT_MODEL, SD_NATIVE,
-                      SD_IMG_CFG, LORA_DIR, CONTROLNET_DIR, CONTROL_MODELS)
+                      SD_IMG_CFG, LORA_DIR, CONTROLNET_DIR, CONTROL_MODELS,
+                      DIFFUSION_URL)
+from . import sdclient
+
+# SDXL works at a 1024 long side. inpaint/outpaint/style all run on the warm SDXL
+# daemon now (one resident model), so the per-op sd15/sdxl/sd15base split is gone;
+# only `control` still cold-spawns sd-cli (its ControlNets are model-specific).
+_SDXL_NATIVE = 1024
 
 
 def _lora_tokens(lora: str) -> str:
@@ -50,42 +57,27 @@ def _work_size(w: int, h: int, target: int) -> tuple[int, int]:
     return ww, hh
 
 
-def _run_sdcli(init_p, mask_p, out_p, prompt, negative, model_p, ww, hh,
-               steps, cfg, strength, seed, img_cfg):
-    cmd = [SDCLI_BIN, "-M", "img_gen", "-m", model_p, "-i", init_p,
-           "--mask", mask_p, "-o", out_p, "-p", prompt,
-           "-W", str(ww), "-H", str(hh), "--steps", str(steps),
-           "--cfg-scale", str(cfg), "--strength", str(strength),
-           "-s", str(seed), "--sampling-method", "euler_a"]
-    if img_cfg is not None:        # inpaint/edit-model image guidance only
-        cmd += ["--img-cfg-scale", str(img_cfg)]
-    if os.path.isdir(LORA_DIR):    # LoRAs referenced as <lora:name:w> in the prompt
-        cmd += ["--lora-model-dir", LORA_DIR]
-    if negative:
-        cmd += ["-n", negative]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(out_p):
-        raise RuntimeError(f"sd-cli failed (exit {r.returncode}): {r.stderr[-600:]}")
-
-
 def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
               negative: str, model: str, steps: int, cfg: float,
               strength: float, seed: int, img_cfg: float,
               lora: str = "") -> Image.Image:
-    """init (RGBA) + mask (L, white=regen) at region resolution → composited RGBA."""
-    if model not in SD_MODELS:
-        raise RuntimeError(f"unknown model {model!r} (have: {', '.join(SD_MODELS)})")
+    """init (RGBA) + mask (L, white=regen) at region resolution → composited RGBA.
+
+    Runs on the warm SDXL daemon (one HTTP round-trip, no model reload). `model` is
+    accepted for call-site compatibility but no longer selects a checkpoint — the
+    daemon's resident SDXL serves every op (LoRAs via <lora:..> tokens in the prompt).
+    """
     if lora:
         prompt = f"{prompt} {_lora_tokens(lora)}".strip()
     rw, rh = init_rgba.size
-    ww, hh = _work_size(rw, rh, SD_NATIVE.get(model, 512))
-    with tempfile.TemporaryDirectory() as td:
-        ip, mp, op = (os.path.join(td, n) for n in ("init.png", "mask.png", "out.png"))
-        init_rgba.convert("RGB").resize((ww, hh), Image.LANCZOS).save(ip)
-        mask_L.resize((ww, hh), Image.LANCZOS).save(mp)
-        _run_sdcli(ip, mp, op, prompt, negative, SD_MODELS[model], ww, hh,
-                   steps, cfg, strength, seed, img_cfg)
-        result = Image.open(op).convert("RGB").resize((rw, rh), Image.LANCZOS)
+    ww, hh = _work_size(rw, rh, _SDXL_NATIVE)
+    init = init_rgba.convert("RGB").resize((ww, hh), Image.LANCZOS)
+    mask = mask_L.resize((ww, hh), Image.LANCZOS)
+    result = sdclient.generate(
+        DIFFUSION_URL, prompt=prompt, negative=negative,
+        init_image=init, mask_image=mask, width=ww, height=hh,
+        steps=steps, txt_cfg=cfg, img_cfg=img_cfg, strength=strength, seed=seed,
+    ).resize((rw, rh), Image.LANCZOS)
     # Masked area = generated, rest = original (so only the selection changes).
     return Image.composite(result.convert("RGBA"), init_rgba, mask_L)
 

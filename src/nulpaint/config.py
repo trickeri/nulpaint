@@ -48,6 +48,11 @@ SD_NATIVE = {"sd15": 512, "sdxl": 1024, "sd15base": 512}
 # (≈cfg) => seamless content-aware fill. 1.5 follows the prompt while staying coherent.
 SD_IMG_CFG = float(os.environ.get("SD_IMG_CFG", "1.5"))
 
+# Warm stable-diffusion.cpp daemon (sd-server). inpaint/outpaint/style POST here
+# instead of cold-spawning sd-cli per call — the daemon holds SDXL resident, so a
+# generation is one HTTP round-trip. See ~/programming/Models/diffusionmodel.
+DIFFUSION_URL = os.environ.get("DIFFUSION_URL", "http://127.0.0.1:48480")
+
 # LoRAs: drop <name>.safetensors here, reference as <lora:name:weight> (or the
 # --lora flag). ControlNets: <name>.safetensors here, selected by --control.
 LORA_DIR = os.environ.get("NULPAINT_LORA_DIR", os.path.join(_KRITA_ROOT, "models/loras"))
