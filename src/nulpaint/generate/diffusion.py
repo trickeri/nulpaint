@@ -10,22 +10,69 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import subprocess
 import tempfile
+import time
 
 from PIL import Image, ImageDraw
 
 from ..bridge import BridgeClient
 from ..config import (SDCLI_BIN, SD_MODELS, SD_DEFAULT_MODEL, SD_NATIVE,
                       SD_IMG_CFG, LORA_DIR, CONTROLNET_DIR, CONTROL_MODELS,
-                      DIFFUSION_URL)
+                      DIFFUSION_URL, INPAINT_URL, DIFFUSION_SERVICE,
+                      INPAINT_SERVICE, MODELMANAGER_STATE)
 from . import sdclient
 
-# SDXL works at a 1024 long side. inpaint/outpaint/style all run on the warm SDXL
-# daemon now (one resident model), so the per-op sd15/sdxl/sd15base split is gone;
-# only `control` still cold-spawns sd-cli (its ControlNets are model-specific).
+# SDXL works at a 1024 long side. inpaint/outpaint/style all run on a warm SDXL
+# daemon now (no per-call reload). Two checkpoints share the GPU one-at-a-time:
+# the inpainting checkpoint (inpaint/outpaint) and the base (generation/style).
+# Only `control` still cold-spawns sd-cli (its ControlNets are model-specific).
 _SDXL_NATIVE = 1024
+
+
+def _mm_placement(service: str) -> dict | None:
+    try:
+        with open(MODELMANAGER_STATE, encoding="utf-8") as fh:
+            for m in (json.load(fh).get("models") or []):
+                if m.get("service") == service:
+                    return m
+    except Exception:
+        pass
+    return None
+
+
+def _set_image_mode(active: str, parked: str, *, timeout: float = 45.0) -> None:
+    """Make `active` the GPU-resident SDXL checkpoint and park `parked` in RAM via the
+    modelmanager, then wait until `active` is actually serving on the GPU. No-op if it
+    already is. This is the "image model mode" swap (generation vs inpainting)."""
+    cur = _mm_placement(active)
+    if cur and cur.get("up") and cur.get("placement") == "gpu":
+        return  # already warm on the GPU
+    for svc, tgt in ((active, "gpu"), (parked, "ram")):
+        subprocess.run(["qdbus6", "com.nuldrums.ModelManager", "/ModelManager",
+                        "com.nuldrums.ModelManager.Move", svc, tgt],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        m = _mm_placement(active)
+        if m and m.get("up") and m.get("placement") == "gpu":
+            return
+    # fall through — the generation call itself will surface any real failure
+
+
+def set_mode(mode: str) -> dict:
+    """Image-model mode toggle: 'generate'|'style' -> base SDXL warm; 'inpaint'|
+    'outpaint' -> SDXL-inpainting warm (the other parks in RAM). Called by the
+    NulpaintAI docker's mode buttons to pre-swap before generating."""
+    mode = (mode or "").lower()
+    if mode in ("inpaint", "outpaint"):
+        _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)
+        return {"mode": mode, "warm": "inpaint", "url": INPAINT_URL}
+    _set_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE)
+    return {"mode": mode or "generate", "warm": "base", "url": DIFFUSION_URL}
 
 
 def _lora_tokens(lora: str) -> str:
@@ -60,12 +107,12 @@ def _work_size(w: int, h: int, target: int) -> tuple[int, int]:
 def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
               negative: str, model: str, steps: int, cfg: float,
               strength: float, seed: int, img_cfg: float,
-              lora: str = "") -> Image.Image:
+              lora: str = "", url: str = DIFFUSION_URL) -> Image.Image:
     """init (RGBA) + mask (L, white=regen) at region resolution → composited RGBA.
 
-    Runs on the warm SDXL daemon (one HTTP round-trip, no model reload). `model` is
-    accepted for call-site compatibility but no longer selects a checkpoint — the
-    daemon's resident SDXL serves every op (LoRAs via <lora:..> tokens in the prompt).
+    Runs on the warm SDXL daemon at `url` (one HTTP round-trip, no model reload).
+    `model` is accepted for call-site compatibility but no longer selects a checkpoint
+    — which daemon (`url`) is hit picks the checkpoint (LoRAs via <lora:..> in the prompt).
     """
     if lora:
         prompt = f"{prompt} {_lora_tokens(lora)}".strip()
@@ -74,7 +121,7 @@ def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
     init = init_rgba.convert("RGB").resize((ww, hh), Image.LANCZOS)
     mask = mask_L.resize((ww, hh), Image.LANCZOS)
     result = sdclient.generate(
-        DIFFUSION_URL, prompt=prompt, negative=negative,
+        url, prompt=prompt, negative=negative,
         init_image=init, mask_image=mask, width=ww, height=hh,
         steps=steps, txt_cfg=cfg, img_cfg=img_cfg, strength=strength, seed=seed,
     ).resize((rw, rh), Image.LANCZOS)
@@ -101,7 +148,8 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
     mask = _b64_to_img(client.call("selection.mask_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("L")
-    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora)
+    _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)   # inpaint -> SDXL-inpainting on GPU
+    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora, url=INPAINT_URL)
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))
     return {"mode": "inpaint", "model": model, "x": x0, "y": y0, "w": rw, "h": rh}
 
@@ -129,7 +177,8 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
     # White everywhere, black over the original content rect (l,t,W,H) = keep it.
     mask = Image.new("L", (NW, NH), 255)
     ImageDraw.Draw(mask).rectangle([l, t, l + W - 1, t + H - 1], fill=0)
-    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora)
+    _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)   # outpaint -> SDXL-inpainting on GPU
+    out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora, url=INPAINT_URL)
     client.call("layer.set_region", x=0, y=0, png_b64=_img_to_b64(out))
     return {"mode": "outpaint", "model": model, "width": NW, "height": NH,
             "pixels": pixels, "sides": sorted(want)}
@@ -157,8 +206,9 @@ def style(client: BridgeClient, prompt: str, *, negative: str = "",
         mask = Image.new("L", (rw, rh), 255)   # whole layer
         scope = "layer"
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
+    _set_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE)   # style -> base SDXL on GPU
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed,
-                    img_cfg=None, lora=lora)  # base-model img2img: no inpaint image-guidance
+                    img_cfg=None, lora=lora, url=DIFFUSION_URL)  # base-model img2img
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))
     return {"mode": "style", "model": model, "scope": scope,
             "strength": strength, "x": x0, "y": y0, "w": rw, "h": rh}

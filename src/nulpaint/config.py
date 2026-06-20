@@ -52,6 +52,13 @@ SD_IMG_CFG = float(os.environ.get("SD_IMG_CFG", "1.5"))
 # instead of cold-spawning sd-cli per call — the daemon holds SDXL resident, so a
 # generation is one HTTP round-trip. See ~/programming/Models/diffusionmodel.
 DIFFUSION_URL = os.environ.get("DIFFUSION_URL", "http://127.0.0.1:48480")
+# SDXL inpainting daemon (the dedicated inpainting checkpoint) — inpaint/outpaint
+# route here, generation/style to DIFFUSION_URL. Only one is GPU-resident at a time:
+# the image-model "mode" swaps them via the modelmanager (the other parks in RAM).
+INPAINT_URL = os.environ.get("INPAINT_URL", "http://127.0.0.1:48481")
+DIFFUSION_SERVICE = "diffusionmodel"
+INPAINT_SERVICE = "diffusionmodel-inpaint"
+MODELMANAGER_STATE = os.path.expanduser("~/.cache/modelmanager/state.json")
 
 # LoRAs: drop <name>.safetensors here, reference as <lora:name:weight> (or the
 # --lora flag). ControlNets: <name>.safetensors here, selected by --control.

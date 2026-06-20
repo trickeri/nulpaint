@@ -247,6 +247,13 @@ def cmd_style(a: argparse.Namespace) -> None:
           f"{res['w']}x{res['h']} (strength {res['strength']})")
 
 
+def cmd_mode(a: argparse.Namespace) -> None:
+    # Pre-swap the SDXL checkpoint for an image-model mode (no bridge needed).
+    from .generate import diffusion
+    res = diffusion.set_mode(a.mode)
+    print(f"nulpaint: image-model mode '{res['mode']}' -> {res['warm']} checkpoint warm")
+
+
 def cmd_control(a: argparse.Namespace) -> None:
     from .generate import control
     with _connect(a.wait) as c:
@@ -312,6 +319,11 @@ def build_parser() -> argparse.ArgumentParser:
     pss.add_argument("--object", action="store_true",
                      help="arbitrary object (segmodel) instead of a person (mattemodel)")
     pss.set_defaults(func=cmd_select_subject)
+
+    pmode = sub.add_parser("mode", help="pre-load the SDXL checkpoint for an image-model mode")
+    pmode.add_argument("mode", choices=["generate", "style", "inpaint", "outpaint"],
+                       help="generate/style -> base SDXL; inpaint/outpaint -> SDXL inpainting")
+    pmode.set_defaults(func=cmd_mode)
 
     pip = sub.add_parser("inpaint", help="generative fill the current selection")
     _add_diffusion_args(pip)
