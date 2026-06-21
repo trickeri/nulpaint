@@ -370,12 +370,29 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Distinct exit code so the docker can tell "model not loaded" from a real failure
+# and offer to load it, instead of just reporting an error.
+EXIT_MODEL_NOT_LOADED = 10
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
     except BridgeError as e:
         sys.exit(f"nulpaint: bridge error — is Krita running with the plugin enabled? ({e})")
+    except Exception as e:  # noqa: BLE001
+        # The manual model manager is the source of truth — a generate verb won't
+        # silently load a checkpoint. Surface the need to load with a parseable line
+        # + a dedicated exit code so the docker can prompt; rethrow anything else.
+        from .generate.diffusion import ModelNotLoadedError
+        if isinstance(e, ModelNotLoadedError):
+            print(f"NEEDS_LOAD mode={e.mode} model={e.name!r} parks={e.parked_name!r}",
+                  file=sys.stderr)
+            print(f"nulpaint: {e} — load it ({e.name} to GPU, {e.parked_name} to RAM) "
+                  f"then retry, e.g.  nulpaint mode {e.mode}", file=sys.stderr)
+            sys.exit(EXIT_MODEL_NOT_LOADED)
+        raise
 
 
 if __name__ == "__main__":

@@ -43,12 +43,36 @@ def _mm_placement(service: str) -> dict | None:
     return None
 
 
-def _set_image_mode(active: str, parked: str, *, timeout: float = 45.0) -> None:
-    """Make `active` the GPU-resident SDXL checkpoint and park `parked` in RAM via the
-    modelmanager, then wait until `active` is actually serving on the GPU. No-op if it
-    already is. This is the "image model mode" swap (generation vs inpainting)."""
+# Friendly names for the two SDXL checkpoints (for the load prompt).
+_SVC_NAME = {DIFFUSION_SERVICE: "SDXL Base", INPAINT_SERVICE: "SDXL Inpainting"}
+
+
+class ModelNotLoadedError(RuntimeError):
+    """Raised when a generate verb needs an SDXL checkpoint that the model manager
+    hasn't placed on the GPU. We do NOT load it silently — the caller (docker / CLI)
+    catches this and PROMPTS the user to load it. `parked` is the other checkpoint
+    that the load would swap out to RAM (they're mutually exclusive in VRAM)."""
+    def __init__(self, service: str, parked: str, mode: str):
+        self.service = service
+        self.parked = parked
+        self.mode = mode
+        self.name = _SVC_NAME.get(service, service)
+        self.parked_name = _SVC_NAME.get(parked, parked)
+        super().__init__(f"{self.name} is not loaded on the GPU (needed for {mode})")
+
+
+def _image_mode_ready(active: str) -> bool:
+    """True iff `active` is up and GPU-resident per the model manager state."""
     cur = _mm_placement(active)
-    if cur and cur.get("up") and cur.get("placement") == "gpu":
+    return bool(cur and cur.get("up") and cur.get("placement") == "gpu")
+
+
+def _load_image_mode(active: str, parked: str, *, timeout: float = 45.0) -> None:
+    """EXPLICIT load: make `active` the GPU-resident SDXL checkpoint and park `parked`
+    in RAM via the modelmanager, then wait until `active` is serving on the GPU. No-op
+    if it already is. Only ever called on a deliberate user action (the `mode` verb /
+    a confirmed load prompt) — never as a silent side effect of generating."""
+    if _image_mode_ready(active):
         return  # already warm on the GPU
     for svc, tgt in ((active, "gpu"), (parked, "ram")):
         subprocess.run(["qdbus6", "com.nuldrums.ModelManager", "/ModelManager",
@@ -57,21 +81,34 @@ def _set_image_mode(active: str, parked: str, *, timeout: float = 45.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(0.5)
-        m = _mm_placement(active)
-        if m and m.get("up") and m.get("placement") == "gpu":
+        if _image_mode_ready(active):
             return
     # fall through — the generation call itself will surface any real failure
 
 
+def _require_image_mode(active: str, parked: str, mode: str) -> None:
+    """Gate at the top of every generate verb. The manual model manager is the source
+    of truth for VRAM, so we never auto-load: if `active` isn't GPU-resident we raise
+    ModelNotLoadedError so the UI can prompt. Set NULPAINT_AUTOLOAD=1 to opt back into
+    automatic loading (e.g. the voice/headless path, which can't show a prompt)."""
+    if _image_mode_ready(active):
+        return
+    if os.environ.get("NULPAINT_AUTOLOAD") == "1":
+        _load_image_mode(active, parked)
+        return
+    raise ModelNotLoadedError(active, parked, mode)
+
+
 def set_mode(mode: str) -> dict:
     """Image-model mode toggle: 'generate'|'style' -> base SDXL warm; 'inpaint'|
-    'outpaint' -> SDXL-inpainting warm (the other parks in RAM). Called by the
-    NulpaintAI docker's mode buttons to pre-swap before generating."""
+    'outpaint' -> SDXL-inpainting warm (the other parks in RAM). This is the EXPLICIT
+    load path — the docker's confirmed load prompt and the `nulpaint mode` verb call
+    it; selecting a mode in the docker no longer triggers it."""
     mode = (mode or "").lower()
     if mode in ("inpaint", "outpaint"):
-        _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)
+        _load_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)
         return {"mode": mode, "warm": "inpaint", "url": INPAINT_URL}
-    _set_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE)
+    _load_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE)
     return {"mode": mode or "generate", "warm": "base", "url": DIFFUSION_URL}
 
 
@@ -135,6 +172,7 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
             img_cfg: float = SD_IMG_CFG, lora: str = "") -> dict:
     """Inpaint the current selection. `pad` adds context margin around the bbox."""
     model = model or SD_DEFAULT_MODEL
+    _require_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE, "inpaint")  # gate before any work
     sel = client.call("selection.info")
     if not sel.get("hasSelection"):
         raise RuntimeError("no selection — select the area to inpaint first")
@@ -148,7 +186,6 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
     mask = _b64_to_img(client.call("selection.mask_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("L")
-    _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)   # inpaint -> SDXL-inpainting on GPU
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora, url=INPAINT_URL)
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))
     return {"mode": "inpaint", "model": model, "x": x0, "y": y0, "w": rw, "h": rh}
@@ -161,6 +198,7 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
     """Extend the canvas and generate into the new border, using existing pixels
     as context. sides: 'all' or a comma list of left,right,top,bottom."""
     model = model or SD_DEFAULT_MODEL
+    _require_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE, "outpaint")  # gate before image.extend
     info = client.call("document.info")
     W, H = info["width"], info["height"]
     want = {"left", "right", "top", "bottom"} if sides == "all" else set(sides.split(","))
@@ -177,7 +215,6 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
     # White everywhere, black over the original content rect (l,t,W,H) = keep it.
     mask = Image.new("L", (NW, NH), 255)
     ImageDraw.Draw(mask).rectangle([l, t, l + W - 1, t + H - 1], fill=0)
-    _set_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE)   # outpaint -> SDXL-inpainting on GPU
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora, url=INPAINT_URL)
     client.call("layer.set_region", x=0, y=0, png_b64=_img_to_b64(out))
     return {"mode": "outpaint", "model": model, "width": NW, "height": NH,
@@ -193,6 +230,7 @@ def style(client: BridgeClient, prompt: str, *, negative: str = "",
     (structure dissolves above that). Uses a base model (img2img); the sd15
     *inpaint* model is unsuitable for whole-image style, so default is sdxl.
     """
+    _require_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE, "style")  # gate before any work
     info = client.call("document.info")
     W, H = info["width"], info["height"]
     sel = client.call("selection.info")
@@ -206,7 +244,6 @@ def style(client: BridgeClient, prompt: str, *, negative: str = "",
         mask = Image.new("L", (rw, rh), 255)   # whole layer
         scope = "layer"
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
-    _set_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE)   # style -> base SDXL on GPU
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed,
                     img_cfg=None, lora=lora, url=DIFFUSION_URL)  # base-model img2img
     client.call("layer.set_region", x=x0, y=y0, png_b64=_img_to_b64(out))

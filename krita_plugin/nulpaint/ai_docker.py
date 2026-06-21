@@ -25,14 +25,21 @@ try:
     from PyQt6.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPlainTextEdit,
         QPushButton, QToolButton, QButtonGroup, QLabel, QLineEdit, QComboBox,
-        QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame, QFileDialog)
+        QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame, QFileDialog,
+        QMessageBox)
     from PyQt6.QtCore import QTimer
 except ImportError:  # pragma: no cover — Qt5 fallback
     from PyQt5.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPlainTextEdit,
         QPushButton, QToolButton, QButtonGroup, QLabel, QLineEdit, QComboBox,
-        QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame, QFileDialog)
+        QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame, QFileDialog,
+        QMessageBox)
     from PyQt5.QtCore import QTimer
+
+# Mirror of nulpaint.cli.EXIT_MODEL_NOT_LOADED — the CLI exits with this code when
+# a generate verb needs an SDXL checkpoint the model manager hasn't put on the GPU,
+# so the docker can prompt to load it instead of reporting a generic failure.
+_EXIT_MODEL_NOT_LOADED = 10
 
 # ── paths ────────────────────────────────────────────────────────────────────
 _KRITA_ROOT = os.path.expanduser("~/programming/Krita")
@@ -148,6 +155,9 @@ class NulPaintAIDocker(DockWidget):
         super().__init__()
         self.setWindowTitle("NulPaint AI")
         self._proc = None       # generate / select job
+        self._proc_kind = None  # "gen" | "select" | "load" — what _proc is doing
+        self._last_gen = None   # (args, label, verb) of the last generate spawned
+        self._pending_gen = None  # (args, label) to retry after a confirmed model load
         self._train = None      # lora-training job
 
         scroll = QScrollArea()
@@ -419,16 +429,10 @@ class NulPaintAIDocker(DockWidget):
             j = self._model.findText(default_model)
             if j >= 0:
                 self._model.setCurrentIndex(j)
-        # Pre-warm the SDXL checkpoint for this mode (swap VRAM<->RAM via the
-        # modelmanager) so it's resident by the time you hit Generate. Control modes
-        # (repose/canny) keep using sd-cli, so no daemon swap there.
-        verb = self._cur_mode()[2]
-        if verb in ("inpaint", "outpaint", "style"):
-            try:
-                subprocess.Popen([_launcher(), "mode", verb],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+        # NB: selecting a mode no longer pre-warms its SDXL checkpoint. The manual
+        # model manager is the source of truth for VRAM, so we don't move models on a
+        # mere radio-button click — Generate prompts to load the checkpoint if it
+        # isn't already on the GPU (see _tick's NEEDS_LOAD handling).
 
     def _has_selection(self):
         doc = Krita.instance().activeDocument()
@@ -479,13 +483,14 @@ class NulPaintAIDocker(DockWidget):
         return ",".join(m[s] for s in on)
 
     # ── actions ──────────────────────────────────────────────────────────────────
-    def _spawn(self, args, status):
+    def _spawn(self, args, status, kind="gen"):
         if self._proc is not None:
             return False
         try:
             self._proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
+            self._proc_kind = kind
             self._go.setEnabled(False)
             self._sel_person.setEnabled(False)
             self._sel_object.setEnabled(False)
@@ -497,7 +502,8 @@ class NulPaintAIDocker(DockWidget):
 
     def _run_select(self, is_object):
         args = [_launcher(), "select-subject"] + (["--object"] if is_object else [])
-        self._spawn(args, "selecting %s…" % ("object" if is_object else "person"))
+        self._spawn(args, "selecting %s…" % ("object" if is_object else "person"),
+                    kind="select")
 
     def _run_generate(self):
         prompt = self._prompt.toPlainText().strip()
@@ -509,7 +515,33 @@ class NulPaintAIDocker(DockWidget):
             self._status.setText("make a selection first")
             return
         args, label = self._build_generate_command()
-        self._spawn(args, "generating (%s)… first run loads the model" % label.lower())
+        self._last_gen = (args, label, self._cur_mode()[2])
+        self._spawn(args, "generating (%s)…" % label.lower(), kind="gen")
+
+    # Model needed by each generate mode (for the load prompt). control modes
+    # (repose/canny) cold-spawn sd-cli, so they're not gated here.
+    _MODE_MODEL = {
+        "inpaint":  ("SDXL Inpainting", "SDXL Base"),
+        "outpaint": ("SDXL Inpainting", "SDXL Base"),
+        "style":    ("SDXL Base",       "SDXL Inpainting"),
+    }
+
+    def _prompt_load(self, verb, args, label):
+        """A generate verb reported its checkpoint isn't on the GPU. Ask before
+        loading — the manual model manager owns VRAM, so we never load silently."""
+        model, parked = self._MODE_MODEL.get(verb, (verb, "the other model"))
+        ans = QMessageBox.question(
+            self, "Load model?",
+            "%s isn't loaded on the GPU.\n\nLoad it now for %s?\n"
+            "(%s moves to the GPU; %s parks in system RAM.)"
+            % (model, label.lower(), model, parked),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            self._status.setText("%s not loaded — skipped" % model)
+            return
+        self._pending_gen = (args, label)
+        self._spawn([_launcher(), "mode", verb], "loading %s…" % model, kind="load")
 
     def _run_train(self):
         if self._train is not None:
@@ -550,10 +582,31 @@ class NulPaintAIDocker(DockWidget):
             if self._proc.poll() is None:
                 return
             rc = self._proc.returncode
+            kind = self._proc_kind
             self._proc = None
+            self._proc_kind = None
             self._go.setEnabled(True)
             self._sel_person.setEnabled(True)
             self._sel_object.setEnabled(True)
+
+            if kind == "load":
+                # A confirmed model load finished. On success, run the generate it
+                # was loaded for; otherwise report and drop it.
+                pending, self._pending_gen = self._pending_gen, None
+                if rc == 0 and pending:
+                    args, label = pending
+                    self._spawn(args, "generating (%s)…" % label.lower(), kind="gen")
+                else:
+                    self._status.setText("model load failed (exit %d)" % rc)
+                return
+
+            if kind == "gen" and rc == _EXIT_MODEL_NOT_LOADED and self._last_gen:
+                # The checkpoint wasn't on the GPU. Prompt to load it, then retry —
+                # the manual model manager stays the source of truth for VRAM.
+                args, label, verb = self._last_gen
+                self._prompt_load(verb, args, label)
+                return
+
             doc = Krita.instance().activeDocument()
             if doc is not None:
                 doc.refreshProjection()
