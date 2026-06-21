@@ -89,5 +89,17 @@ class BridgeClient:
     def save_document(self, path: str | None = None) -> Any:
         return self.call("document.save", **({"path": path} if path else {}))
 
+    def close_document(self, name: str | None = None, save: bool = False,
+                       discard: bool = False) -> Any:
+        args: dict[str, Any] = {"save": save, "discard": discard}
+        if name:
+            args["name"] = name
+        return self.call("document.close", **args)
+
+    def resize_document(self, width: int, height: int, mode: str = "scale",
+                        filter: str = "Bicubic") -> Any:
+        return self.call("document.resize", width=width, height=height,
+                         mode=mode, filter=filter)
+
     def undo(self) -> Any:
         return self.call("edit.undo")

@@ -210,6 +210,72 @@ def _cmd_document_save(args):
     return {"ok": bool(ok), "fileName": doc.fileName(), "modified": doc.modified()}
 
 
+def _cmd_document_close(args):
+    """Close a document — the active one, or the one named args['name'].
+
+    args:
+      name: optional document name to close (default: the active document).
+      save: save before closing (document must already have a path).
+      discard: close WITHOUT saving even if modified.
+    A modified doc with neither save nor discard is LEFT OPEN and reported
+    {ok:False, unsaved:True} — never a modal "Save?" prompt (it blocks the GUI
+    thread + bridge) and never a silent discard of work. We clear the modified
+    flag right before close() so close itself can't pop a prompt.
+    """
+    app = Krita.instance()
+    name = args.get("name")
+    if name:
+        doc = next((d for d in app.documents() if d.name() == name), None)
+        if doc is None:
+            raise RuntimeError(f"no open document named {name!r}")
+    else:
+        doc = app.activeDocument()
+        if doc is None:
+            raise RuntimeError("no active document")
+    closed_name = doc.name()
+    doc.setBatchmode(True)
+    if args.get("save"):
+        if not doc.fileName():
+            raise RuntimeError("document has no path yet; can't save before close")
+        doc.save()
+        doc.waitForDone()
+    elif doc.modified() and not args.get("discard"):
+        return {"ok": False, "unsaved": True, "name": closed_name}
+    doc.setModified(False)          # nothing to prompt about -> close won't block
+    ok = doc.close()
+    return {"ok": bool(ok), "closed": closed_name}
+
+
+def _cmd_document_resize(args):
+    """Resize the ACTIVE document to width x height (pixels).
+
+    args:
+      width, height: target size in pixels (required).
+      mode: "scale" (default) resamples the whole image to the new size;
+            "canvas" changes the canvas bounds only (anchor top-left,
+            crop/extend) and never resamples pixels.
+      filter: scale strategy when mode == "scale" (default "Bicubic").
+    Returns the resulting name/size/mode.
+    """
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    w = int(args.get("width", 0))
+    h = int(args.get("height", 0))
+    if w < 1 or h < 1:
+        raise RuntimeError("width and height must be positive pixels")
+    mode = (args.get("mode") or "scale").lower()
+    if mode == "canvas":
+        doc.resizeImage(0, 0, w, h)          # change bounds, keep pixel scale
+    else:
+        res = int(round(doc.resolution())) or 72
+        doc.scaleImage(w, h, res, res, args.get("filter", "Bicubic"))
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"name": doc.name(), "width": doc.width(), "height": doc.height(),
+            "mode": mode}
+
+
 def _cmd_grab_canvas(args):
     """Grab the canvas widget (incl. live tool decorations/preview) to a PNG.
 
@@ -600,6 +666,8 @@ COMMANDS = {
     "document.info": _cmd_document_info,
     "document.create": _cmd_document_create,
     "document.save": _cmd_document_save,
+    "document.close": _cmd_document_close,
+    "document.resize": _cmd_document_resize,
     "layer.add": _cmd_layer_add,
     "shape.draw": _cmd_shape_draw,
     "tool.brush_stroke": _cmd_brush_stroke,

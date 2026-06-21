@@ -134,6 +134,19 @@ def _connect(timeout: float) -> BridgeClient:
     sys.exit(f"nulpaint: could not reach Krita bridge within {timeout:g}s ({last})")
 
 
+def _bridge_up() -> bool:
+    """Quick one-shot probe: is the in-Krita bridge already reachable? Used by
+    `new` to decide whether it must launch Krita first (avoids waiting the full
+    --wait timeout when Krita simply isn't running yet)."""
+    c = BridgeClient()
+    try:
+        c.connect()
+    except OSError:
+        return False
+    c.close()
+    return True
+
+
 # --- subcommands ------------------------------------------------------------
 def cmd_launch(a: argparse.Namespace) -> None:
     if a.no_focus:
@@ -204,6 +217,45 @@ def cmd_demo(a: argparse.Namespace) -> None:
                            _scale_items(_SQUARES, sx, sy), layer="Squares")
         print("squares:", json.dumps(sq))
     print("nulpaint: demo complete")
+
+
+def cmd_new(a: argparse.Namespace) -> None:
+    """Create a new blank document. Dimensions come from a preset (default
+    1080Land) unless overridden by --width/--height/--resolution. Launches Krita
+    first if the bridge isn't already up, so "create a new document" works even
+    from a cold start."""
+    if a.preset not in PRESETS:
+        sys.exit(f"nulpaint: unknown preset {a.preset!r} (have: {', '.join(PRESETS)})")
+    pw, ph, pres = PRESETS[a.preset]
+    w, h, res = a.width or pw, a.height or ph, a.resolution or pres
+    if not a.no_launch and not _bridge_up():
+        binary = _krita_binary(a.krita)
+        subprocess.Popen([binary, "--nosplash"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"nulpaint: launching {binary} …")
+    with _connect(a.wait) as c:
+        doc = c.create_document(w, h, name=a.name, resolution=res)
+    print(f"nulpaint: new {doc['width']}x{doc['height']} document '{doc['name']}'")
+
+
+def cmd_close(a: argparse.Namespace) -> None:
+    """Close the active document (or --name). A modified doc is left open unless
+    you pass --save or --discard (so close never blocks on a save prompt)."""
+    with _connect(a.wait) as c:
+        res = c.close_document(name=a.name, save=a.save, discard=a.discard)
+    if res.get("unsaved"):
+        sys.exit(f"nulpaint: '{res['name']}' has unsaved changes — "
+                 f"close with --save or --discard")
+    print(f"nulpaint: closed '{res['closed']}'")
+
+
+def cmd_resize(a: argparse.Namespace) -> None:
+    """Resize the active document — scale the image (default) or, with --canvas,
+    change the canvas bounds (crop/extend, no resampling)."""
+    mode = "canvas" if a.canvas else "scale"
+    with _connect(a.wait) as c:
+        res = c.resize_document(a.width, a.height, mode=mode, filter=a.filter)
+    print(f"nulpaint: resized '{res['name']}' -> {res['width']}x{res['height']} ({res['mode']})")
 
 
 def cmd_select_subject(a: argparse.Namespace) -> None:
@@ -309,6 +361,33 @@ def build_parser() -> argparse.ArgumentParser:
     pd = sub.add_parser("demo", help="create a doc + draw circles/squares")
     pd.add_argument("--preset", default="1080Land", help="document preset (default 1080Land)")
     pd.set_defaults(func=cmd_demo)
+
+    pnew = sub.add_parser("new", help="create a new blank document (launches Krita if needed)")
+    pnew.add_argument("--preset", default="1080Land",
+                      help=f"document preset (default 1080Land; have: {', '.join(PRESETS)})")
+    pnew.add_argument("--width", type=int, help="override preset width (px)")
+    pnew.add_argument("--height", type=int, help="override preset height (px)")
+    pnew.add_argument("--resolution", type=float, help="override resolution (ppi)")
+    pnew.add_argument("--name", default="Untitled", help="document name")
+    pnew.add_argument("--no-launch", action="store_true",
+                      help="don't auto-launch Krita if the bridge is down")
+    pnew.add_argument("--krita", help="path to the krita binary (default: ~/.local/bin/krita)")
+    pnew.set_defaults(func=cmd_new)
+
+    pcl = sub.add_parser("close", help="close the active document (or --name)")
+    pcl.add_argument("--name", help="close the document with this name (default: active)")
+    pcl.add_argument("--save", action="store_true", help="save before closing")
+    pcl.add_argument("--discard", action="store_true",
+                     help="close even if modified, discarding unsaved changes")
+    pcl.set_defaults(func=cmd_close)
+
+    prs = sub.add_parser("resize", help="resize the active document (scale, or --canvas)")
+    prs.add_argument("width", type=int, help="target width in px")
+    prs.add_argument("height", type=int, help="target height in px")
+    prs.add_argument("--canvas", action="store_true",
+                     help="change canvas bounds (crop/extend) instead of scaling the image")
+    prs.add_argument("--filter", default="Bicubic", help="scale strategy (default Bicubic)")
+    prs.set_defaults(func=cmd_resize)
 
     pn = sub.add_parser("no-focus-rule", help="manage the KWin no-focus rule")
     pn.add_argument("action", choices=["add", "remove"])
