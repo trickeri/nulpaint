@@ -836,6 +836,32 @@ def _resolve_node(doc, args):
     return None
 
 
+def _resolve_ident(doc, ident):
+    """Resolve a single identifier — a uuid (braces optional) or an exact layer
+    name (first match) — to a node. None if not found / empty."""
+    if not ident:
+        return None
+    ident = str(ident)
+    norm = ident.strip("{}").lower()
+    for n in _walk_nodes(doc.rootNode()):
+        u = _node_uuid(n)
+        if u == ident or u.strip("{}").lower() == norm:
+            return n
+    for n in _walk_nodes(doc.rootNode()):
+        if n.name() == ident:
+            return n
+    return None
+
+
+def _resolve_target(doc, args):
+    """Target node for the management commands: uuid/path (via _resolve_node) or a
+    `node` field holding a uuid|name (via _resolve_ident)."""
+    n = _resolve_node(doc, args)
+    if n is not None:
+        return n
+    return _resolve_ident(doc, args.get("node"))
+
+
 def _layer_text(node):
     """Concatenated tspan text of a vector layer (None for non-vector nodes)."""
     if node.type() != "vectorlayer":
@@ -894,6 +920,102 @@ def _cmd_node_set_visible(args):
         doc.refreshProjection()
     return {"uuid": _node_uuid(node), "name": node.name(),
             "visible": bool(node.visible())}
+
+
+# --- real-time layer/group management ---------------------------------------
+# Nodes are addressed by uuid (preferred, stable) or name. A "true" move keeps the
+# node object (blend mode, opacity, masks, styles) — it re-parents, never copies.
+
+def _cmd_node_move(args):
+    """Move/reparent a node live. Target: uuid|path|node(name|uuid). Optional:
+    parent (group name|uuid; default keeps current parent), above (sit directly
+    above this sibling), below (sit directly below this sibling). With neither
+    above/below the node goes to the TOP of the parent."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found: %r" % (args.get("node") or args.get("uuid") or args.get("path")))
+    new_parent = (_resolve_ident(doc, args.get("parent")) if args.get("parent")
+                  else (node.parentNode() or doc.rootNode()))
+    if new_parent is None:
+        raise RuntimeError("parent not found: %r" % args.get("parent"))
+    above = _resolve_ident(doc, args.get("above")) if args.get("above") else None
+    if above is None and args.get("below"):
+        below = _resolve_ident(doc, args.get("below"))
+        if below is not None:
+            sibs = list(new_parent.childNodes())   # index 0 = bottom
+            bi = next((i for i, s in enumerate(sibs)
+                       if _node_uuid(s) == _node_uuid(below)), -1)
+            if bi > 0:
+                above = sibs[bi - 1]               # node above this anchor = below `below`
+    old_parent = node.parentNode() or doc.rootNode()
+    old_parent.removeChildNode(node)               # detaches; wrapper keeps it alive
+    new_parent.addChildNode(node, above)           # re-attach, preserving all props
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"name": node.name(), "uuid": _node_uuid(node),
+            "parent": new_parent.name(), "parent_uuid": _node_uuid(new_parent)}
+
+
+def _cmd_node_create_group(args):
+    """Create a group layer. args: name; parent (name|uuid, default root); above
+    (sibling name|uuid). Returns the new group's uuid."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    group = doc.createNode(args.get("name") or "Group", "grouplayer")
+    parent = (_resolve_ident(doc, args.get("parent")) if args.get("parent")
+              else doc.rootNode())
+    if parent is None:
+        raise RuntimeError("parent not found: %r" % args.get("parent"))
+    above = _resolve_ident(doc, args.get("above")) if args.get("above") else None
+    parent.addChildNode(group, above)
+    doc.refreshProjection()
+    return {"name": group.name(), "uuid": _node_uuid(group), "parent": parent.name()}
+
+
+def _cmd_node_delete(args):
+    """Delete a node (and its children). Target via uuid|path|node(name|uuid)."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    name, uid = node.name(), _node_uuid(node)
+    parent = node.parentNode() or doc.rootNode()
+    parent.removeChildNode(node)
+    doc.refreshProjection()
+    return {"deleted": name, "uuid": uid}
+
+
+def _cmd_node_rename(args):
+    """Rename a node. Target via uuid|path|node; new name in 'new_name'."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    new = args.get("new_name") or args.get("to")
+    if not new:
+        raise RuntimeError("missing 'new_name'")
+    node.setName(new)
+    return {"name": node.name(), "uuid": _node_uuid(node)}
+
+
+def _cmd_node_set_active(args):
+    """Set the active node (so subsequent active-relative ops target it)."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    doc.setActiveNode(node)
+    return {"active": node.name(), "uuid": _node_uuid(node)}
 
 
 def _cmd_text_set(args):
@@ -983,6 +1105,11 @@ COMMANDS = {
     "vector.add_svg": _cmd_vector_add_svg,
     "node.tree": _cmd_node_tree,
     "node.set_visible": _cmd_node_set_visible,
+    "node.move": _cmd_node_move,
+    "node.create_group": _cmd_node_create_group,
+    "node.delete": _cmd_node_delete,
+    "node.rename": _cmd_node_rename,
+    "node.set_active": _cmd_node_set_active,
     "text.set": _cmd_text_set,
     "document.export_png": _cmd_document_export_png,
 }
