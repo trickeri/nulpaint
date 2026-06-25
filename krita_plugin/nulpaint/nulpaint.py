@@ -657,8 +657,97 @@ def _cmd_selection_set_from_mask(args):
     sel = Selection()
     sel.setPixelData(QByteArray(packed), x, y, w, h)
     doc.setSelection(sel)
-    doc.refreshProjection()
+    # NB: deliberately NO doc.refreshProjection() here. A selection is an overlay,
+    # not image pixels — refreshing the whole projection triggers a storm of partial
+    # canvas repaints that erases the just-drawn marching-ants overlay (manual
+    # selection tools never refresh the projection). setSelection already does the
+    # right repaint (outline cache + notifySelectionChanged).
     return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _walk_nodes(node):
+    """Depth-first walk of every descendant node."""
+    for child in node.childNodes():
+        yield child
+        yield from _walk_nodes(child)
+
+
+def _node_uuid(node):
+    try:
+        return node.uniqueId().toString()
+    except Exception:
+        return ""
+
+
+def _cmd_vector_list(args):
+    """List vector (shape) layers, optionally filtered by a name substring,
+    reporting each node's uuid and current shape count. Used to locate a
+    specific layer among duplicate-named ones."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    needle = (args.get("name_contains") or "").lower()
+    out = []
+    for node in _walk_nodes(doc.rootNode()):
+        if node.type() != "vectorlayer":
+            continue
+        name = node.name()
+        if needle and needle not in name.lower():
+            continue
+        try:
+            count = len(node.shapes())
+        except Exception:
+            count = -1
+        out.append({"name": name, "uuid": _node_uuid(node), "shapes": count})
+    return {"layers": out}
+
+
+def _cmd_vector_add_svg(args):
+    """Inject SVG shapes into a vector layer identified by uuid (preferred) or
+    exact name. `svg` is a full SVG document string (same form Krita stores in a
+    shape layer's content.svg). Returns shape counts before/after."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    svg = args.get("svg")
+    if not svg:
+        raise RuntimeError("missing 'svg'")
+    want_uuid = args.get("uuid")
+    want_name = args.get("name")
+
+    target = None
+    matches = []
+    for node in _walk_nodes(doc.rootNode()):
+        if node.type() != "vectorlayer":
+            continue
+        if want_uuid:
+            if _node_uuid(node) == want_uuid:
+                target = node
+                break
+        elif want_name is not None and node.name() == want_name:
+            matches.append(node)
+    if target is None and want_uuid is None:
+        if len(matches) == 1:
+            target = matches[0]
+        elif len(matches) > 1:
+            raise RuntimeError(
+                "name '%s' matched %d vector layers; pass a uuid (use vector.list)"
+                % (want_name, len(matches)))
+    if target is None:
+        raise RuntimeError("no vector layer found for uuid/name given")
+
+    try:
+        before = len(target.shapes())
+    except Exception:
+        before = -1
+    target.addShapesFromSvg(svg)
+    try:
+        after = len(target.shapes())
+    except Exception:
+        after = -1
+    doc.refreshProjection()
+    return {"name": target.name(), "uuid": _node_uuid(target),
+            "shapes_before": before, "shapes_after": after}
 
 
 COMMANDS = {
@@ -682,6 +771,8 @@ COMMANDS = {
     "image.get": _cmd_image_get,
     "image.extend": _cmd_image_extend,
     "selection.set_from_mask": _cmd_selection_set_from_mask,
+    "vector.list": _cmd_vector_list,
+    "vector.add_svg": _cmd_vector_add_svg,
 }
 
 
