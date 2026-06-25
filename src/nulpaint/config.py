@@ -71,3 +71,32 @@ CONTROL_MODELS = {
     "canny": "control_v11p_sd15_canny_fp16.safetensors",
     "openpose": "control_v11p_sd15_openpose_fp16.safetensors",
 }
+
+# --- Cloud diffusion (Nano Banana Pro via OpenRouter) -----------------------
+# An instruction-based image editor (NOT mask-based): prompt + up to ~5 reference
+# images -> a full reimagined image. Used as an alternative `engine` for inpaint/
+# outpaint/style. The whole base image is sent as a reference by default so the
+# result fits the existing style. OpenAI-compatible chat/completions endpoint.
+OPENROUTER_URL = os.environ.get(
+    "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+NANOBANANA_MODEL = os.environ.get(
+    "NANOBANANA_MODEL", "google/gemini-3-pro-image-preview")
+# Max reference images the model accepts (base image + refs). Gemini 3 Pro Image
+# keeps identity across ~5 subjects; keep the total attachment count sane.
+NANOBANANA_MAX_REFS = int(os.environ.get("NANOBANANA_MAX_REFS", "6"))
+_OPENROUTER_KEY_FILE = os.path.expanduser(
+    os.environ.get("OPENROUTER_KEY_FILE", "~/.config/nulpaint/openrouter.key"))
+
+
+def openrouter_api_key() -> str | None:
+    """Resolve the OpenRouter API key: $OPENROUTER_API_KEY, else the key file
+    (~/.config/nulpaint/openrouter.key, one line). None if neither is set."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    try:
+        with open(_OPENROUTER_KEY_FILE, encoding="utf-8") as fh:
+            line = fh.read().strip()
+            return line or None
+    except OSError:
+        return None

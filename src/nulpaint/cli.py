@@ -267,15 +267,33 @@ def cmd_select_subject(a: argparse.Namespace) -> None:
           f"({res['w']}x{res['h']})")
 
 
+def _nano_kwargs(a: argparse.Namespace) -> dict:
+    return {"engine": a.engine, "ref_files": a.ref, "ref_layers": a.ref_layers,
+            "nano_model": a.nano_model, "review": a.review}
+
+
+def cmd_segment_layers(a: argparse.Namespace) -> None:
+    from .vision.select import segment_layers
+    kind = "person" if a.person else "object"
+    with _connect(a.wait) as c:
+        rep = segment_layers(c, kind=kind, suffix=a.suffix, limit=a.limit)
+    ok = [r for r in rep if r["status"] == "ok"]
+    print(f"nulpaint: segmented {len(ok)}/{len(rep)} paint layers (kind={kind}) "
+          f"-> added '<name>{a.suffix}' layers")
+    for r in rep:
+        if r["status"] != "ok":
+            print(f"  - {r['layer']}: {r['status']}")
+
+
 def cmd_inpaint(a: argparse.Namespace) -> None:
     from .generate import inpaint
     extra = {} if a.img_cfg is None else {"img_cfg": a.img_cfg}
     with _connect(a.wait) as c:
         res = inpaint(c, a.prompt, negative=a.negative, model=a.model,
                       steps=a.steps, cfg=a.cfg, strength=a.strength,
-                      seed=a.seed, pad=a.pad, lora=a.lora, **extra)
-    print(f"nulpaint: inpainted [{res['model']}] {res['w']}x{res['h']} "
-          f"@({res['x']},{res['y']})")
+                      seed=a.seed, pad=a.pad, lora=a.lora, **_nano_kwargs(a), **extra)
+    print(f"nulpaint: inpainted [{res.get('engine', res.get('model'))}] "
+          f"{res['w']}x{res['h']} @({res['x']},{res['y']})")
 
 
 def cmd_outpaint(a: argparse.Namespace) -> None:
@@ -284,9 +302,10 @@ def cmd_outpaint(a: argparse.Namespace) -> None:
     with _connect(a.wait) as c:
         res = outpaint(c, a.prompt, negative=a.negative, model=a.model,
                        pixels=a.pixels, sides=a.sides, steps=a.steps,
-                       cfg=a.cfg, strength=a.strength, seed=a.seed, lora=a.lora, **extra)
-    print(f"nulpaint: outpainted [{res['model']}] -> {res['width']}x{res['height']} "
-          f"(+{res['pixels']}px {','.join(res['sides'])})")
+                       cfg=a.cfg, strength=a.strength, seed=a.seed, lora=a.lora,
+                       **_nano_kwargs(a), **extra)
+    print(f"nulpaint: outpainted [{res.get('engine', res.get('model'))}] -> "
+          f"{res['width']}x{res['height']} (+{res['pixels']}px {','.join(res['sides'])})")
 
 
 def cmd_style(a: argparse.Namespace) -> None:
@@ -294,9 +313,9 @@ def cmd_style(a: argparse.Namespace) -> None:
     with _connect(a.wait) as c:
         res = style(c, a.prompt, negative=a.negative, model=a.model,
                     strength=a.strength, steps=a.steps, cfg=a.cfg, seed=a.seed,
-                    lora=a.lora)
-    print(f"nulpaint: restyled [{res['model']}] {res['scope']} "
-          f"{res['w']}x{res['h']} (strength {res['strength']})")
+                    lora=a.lora, **_nano_kwargs(a))
+    print(f"nulpaint: restyled [{res.get('engine', res.get('model'))}] "
+          f"{res['scope']} {res['w']}x{res['h']}")
 
 
 def cmd_mode(a: argparse.Namespace) -> None:
@@ -329,6 +348,20 @@ def _add_diffusion_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=-1, help="-1 = random")
     p.add_argument("--lora", default="",
                    help="LoRA(s) as name[:weight], comma-separated (files in models/loras/)")
+
+
+def _add_nano_args(p: argparse.ArgumentParser) -> None:
+    """Shared engine/reference flags for the Nano Banana Pro (cloud) path."""
+    p.add_argument("--engine", choices=["local", "nanobanana"], default="local",
+                   help="local SDXL (default) or 'nanobanana' (Nano Banana Pro / OpenRouter)")
+    p.add_argument("--ref", action="append", default=None, metavar="FILE",
+                   help="reference image file for nanobanana (repeatable)")
+    p.add_argument("--ref-layer", action="append", default=None, dest="ref_layers",
+                   metavar="NAME", help="reference layer by name for nanobanana (repeatable)")
+    p.add_argument("--nano-model", default=None, dest="nano_model",
+                   help="override the OpenRouter model slug (default gemini-3-pro-image-preview)")
+    p.add_argument("--no-review", action="store_false", dest="review", default=True,
+                   help="don't add the raw nanobanana generation as a review layer below")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -393,6 +426,15 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("action", choices=["add", "remove"])
     pn.set_defaults(func=cmd_no_focus_rule)
 
+    psl = sub.add_parser("segment-layers",
+                         help="run subject segmentation on every paint layer, adding a trimmed '(cut)' copy")
+    psl.add_argument("--person", action="store_true",
+                     help="use mattemodel (person/RVM) instead of segmodel (object/BiRefNet)")
+    psl.add_argument("--suffix", default=" (cut)", help="name suffix for the added cut layers")
+    psl.add_argument("--limit", type=int, default=0,
+                     help="only process the first N paint layers (0 = all) — for a quick test")
+    psl.set_defaults(func=cmd_segment_layers)
+
     pss = sub.add_parser("select-subject",
                          help="select the subject via the matte/seg services")
     pss.add_argument("--object", action="store_true",
@@ -406,12 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     pip = sub.add_parser("inpaint", help="generative fill the current selection")
     _add_diffusion_args(pip)
+    _add_nano_args(pip)
     pip.add_argument("--pad", type=float, default=0.25,
                      help="context margin around the selection (fraction)")
     pip.set_defaults(func=cmd_inpaint)
 
     pop = sub.add_parser("outpaint", help="extend the canvas with generated content")
     _add_diffusion_args(pop)
+    _add_nano_args(pop)
     pop.add_argument("--pixels", type=int, default=256, help="border to add (px)")
     pop.add_argument("--sides", default="all",
                      help="'all' or comma list: left,right,top,bottom")
@@ -428,6 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--seed", type=int, default=-1)
     pst.add_argument("--lora", default="",
                      help="LoRA(s) as name[:weight], comma-separated (files in models/loras/)")
+    _add_nano_args(pst)
     pst.set_defaults(func=cmd_style)
 
     pcn = sub.add_parser("control",

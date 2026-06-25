@@ -133,6 +133,63 @@ def _img_to_b64(im: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# --- Nano Banana Pro (cloud) engine ----------------------------------------
+# An alternative `engine` for inpaint/outpaint/style: instruction-based editing via
+# OpenRouter instead of local sd.cpp. The whole base image is always sent as a
+# reference (so the result fits the existing style); the caller can add more refs
+# (layers/files). NBP has no mask — we composite its full output back over just the
+# target region, and drop the raw full generation on a review layer below.
+_NANO_GUIDE = {
+    "inpaint": ("Edit this image. {p}. Keep the overall style, lighting, colour "
+                "palette and the rest of the scene consistent and unchanged."),
+    "outpaint": ("Extend (outpaint) this image to fill the empty/transparent border "
+                 "regions, continuing the scene naturally. {p}. Match the existing "
+                 "style, lighting and perspective; leave existing content unchanged."),
+    "style": ("Restyle this image: {p}. Preserve the composition and the layout of "
+              "the subjects."),
+}
+
+
+def _nano_prompt(mode: str, prompt: str) -> str:
+    return _NANO_GUIDE[mode].format(p=(prompt or "").strip() or "improve the image")
+
+
+def _nano_refs(client: BridgeClient, ref_layers, ref_files, W: int, H: int) -> list:
+    """Resolve chosen reference images to PIL: document layers (by name, at canvas
+    bounds) plus image files on disk. The base image is added separately by callers."""
+    refs = []
+    for name in (ref_layers or []):
+        r = client.call("layer.get_region", x=0, y=0, w=W, h=H, layer=name)
+        refs.append(_b64_to_img(r["png_b64"]).convert("RGBA"))
+    for path in (ref_files or []):
+        refs.append(Image.open(path).convert("RGBA"))
+    return refs
+
+
+def _nano_generate(prompt: str, base_full: Image.Image, refs: list,
+                   model: str | None, size: tuple[int, int]) -> Image.Image:
+    """Run Nano Banana on base_full + refs; return RGBA resized to `size` so it
+    aligns with the canvas for region compositing."""
+    from .nanobanana import edit_image
+    out = edit_image(prompt, [base_full.convert("RGBA")] + refs, model=model)
+    return out.convert("RGBA").resize(size, Image.LANCZOS)
+
+
+def _nano_apply_region(client: BridgeClient, nano_full: Image.Image, *,
+                       x: int, y: int, w: int, h: int, mask_L: Image.Image,
+                       review_name: str | None) -> None:
+    """Composite the (masked) Nano output over the ACTIVE layer's region (x,y,w,h) and
+    write it back — so unmasked pixels of the active layer are preserved. Optionally
+    drop the full raw generation on a new review layer below the active one."""
+    active = _b64_to_img(client.call("layer.get_region", x=x, y=y, w=w, h=h)["png_b64"]).convert("RGBA")
+    nano_region = nano_full.crop((x, y, x + w, y + h))
+    comp = Image.composite(nano_region, active, mask_L)
+    client.call("layer.set_region", x=x, y=y, png_b64=_img_to_b64(comp))
+    if review_name:
+        client.call("layer.add_image", name=review_name, x=0, y=0,
+                    png_b64=_img_to_b64(nano_full), place="below_active")
+
+
 def _work_size(w: int, h: int, target: int) -> tuple[int, int]:
     """Scale (w,h) so the long side ≈ target, each snapped to a /64 multiple."""
     s = target / max(w, h)
@@ -169,8 +226,31 @@ def _generate(init_rgba: Image.Image, mask_L: Image.Image, prompt: str,
 def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
             model: str | None = None, steps: int = 20, cfg: float = 7.0,
             strength: float = 1.0, seed: int = -1, pad: float = 0.25,
-            img_cfg: float = SD_IMG_CFG, lora: str = "") -> dict:
-    """Inpaint the current selection. `pad` adds context margin around the bbox."""
+            img_cfg: float = SD_IMG_CFG, lora: str = "", engine: str = "local",
+            ref_layers=None, ref_files=None, nano_model: str | None = None,
+            review: bool = True) -> dict:
+    """Inpaint the current selection. `pad` adds context margin around the bbox.
+
+    engine='local' uses the SDXL inpainting daemon (mask-based). engine='nanobanana'
+    uses Nano Banana Pro (OpenRouter): the whole base image + chosen references go in,
+    its full output is composited back over just the selection, and the raw generation
+    is dropped on a review layer below."""
+    if engine == "nanobanana":
+        info = client.call("document.info")
+        W, H = info["width"], info["height"]
+        sel = client.call("selection.info")
+        if not sel.get("hasSelection"):
+            raise RuntimeError("no selection — select the area to inpaint first")
+        b = sel["bounds"]
+        x0, y0, rw, rh = b["x"], b["y"], b["w"], b["h"]
+        base_full = _b64_to_img(client.call("image.get")["png_b64"]).convert("RGBA")
+        refs = _nano_refs(client, ref_layers, ref_files, W, H)
+        nano = _nano_generate(_nano_prompt("inpaint", prompt), base_full, refs, nano_model, (W, H))
+        mask = _b64_to_img(client.call("selection.mask_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("L")
+        _nano_apply_region(client, nano, x=x0, y=y0, w=rw, h=rh, mask_L=mask,
+                           review_name=("nano banana (raw)" if review else None))
+        return {"mode": "inpaint", "engine": "nanobanana", "x": x0, "y": y0, "w": rw, "h": rh}
+
     model = model or SD_DEFAULT_MODEL
     _require_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE, "inpaint")  # gate before any work
     sel = client.call("selection.info")
@@ -194,11 +274,12 @@ def inpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
              model: str | None = None, pixels: int = 256, sides: str = "all",
              steps: int = 20, cfg: float = 7.0, strength: float = 1.0,
-             seed: int = -1, img_cfg: float = SD_IMG_CFG, lora: str = "") -> dict:
+             seed: int = -1, img_cfg: float = SD_IMG_CFG, lora: str = "",
+             engine: str = "local", ref_layers=None, ref_files=None,
+             nano_model: str | None = None, review: bool = True) -> dict:
     """Extend the canvas and generate into the new border, using existing pixels
-    as context. sides: 'all' or a comma list of left,right,top,bottom."""
-    model = model or SD_DEFAULT_MODEL
-    _require_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE, "outpaint")  # gate before image.extend
+    as context. sides: 'all' or a comma list of left,right,top,bottom.
+    engine='nanobanana' fills the border via Nano Banana Pro instead of local SDXL."""
     info = client.call("document.info")
     W, H = info["width"], info["height"]
     want = {"left", "right", "top", "bottom"} if sides == "all" else set(sides.split(","))
@@ -209,12 +290,26 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
     if not (l or t or r or bot):
         raise RuntimeError(f"no valid sides in {sides!r}")
 
+    if engine != "nanobanana":
+        model = model or SD_DEFAULT_MODEL
+        _require_image_mode(INPAINT_SERVICE, DIFFUSION_SERVICE, "outpaint")  # gate before image.extend
+
     ext = client.call("image.extend", left=l, top=t, right=r, bottom=bot)
     NW, NH = ext["width"], ext["height"]
-    init = _b64_to_img(client.call("layer.get_region", x=0, y=0, w=NW, h=NH)["png_b64"]).convert("RGBA")
     # White everywhere, black over the original content rect (l,t,W,H) = keep it.
     mask = Image.new("L", (NW, NH), 255)
     ImageDraw.Draw(mask).rectangle([l, t, l + W - 1, t + H - 1], fill=0)
+
+    if engine == "nanobanana":
+        base_full = _b64_to_img(client.call("image.get")["png_b64"]).convert("RGBA")
+        refs = _nano_refs(client, ref_layers, ref_files, NW, NH)
+        nano = _nano_generate(_nano_prompt("outpaint", prompt), base_full, refs, nano_model, (NW, NH))
+        _nano_apply_region(client, nano, x=0, y=0, w=NW, h=NH, mask_L=mask,
+                           review_name=("nano banana (raw)" if review else None))
+        return {"mode": "outpaint", "engine": "nanobanana", "width": NW, "height": NH,
+                "pixels": pixels, "sides": sorted(want)}
+
+    init = _b64_to_img(client.call("layer.get_region", x=0, y=0, w=NW, h=NH)["png_b64"]).convert("RGBA")
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed, img_cfg, lora, url=INPAINT_URL)
     client.call("layer.set_region", x=0, y=0, png_b64=_img_to_b64(out))
     return {"mode": "outpaint", "model": model, "width": NW, "height": NH,
@@ -223,14 +318,16 @@ def outpaint(client: BridgeClient, prompt: str, *, negative: str = "",
 
 def style(client: BridgeClient, prompt: str, *, negative: str = "",
           model: str = "sdxl", strength: float = 0.55, steps: int = 24,
-          cfg: float = 7.0, seed: int = -1, lora: str = "") -> dict:
+          cfg: float = 7.0, seed: int = -1, lora: str = "", engine: str = "local",
+          ref_layers=None, ref_files=None, nano_model: str | None = None,
+          review: bool = True) -> dict:
     """Restyle via img2img — the selection if there is one, else the whole layer.
 
     `strength` is the transform amount: ~0.3 subtle, ~0.55 balanced, ~0.8 strong
     (structure dissolves above that). Uses a base model (img2img); the sd15
     *inpaint* model is unsuitable for whole-image style, so default is sdxl.
+    engine='nanobanana' restyles via Nano Banana Pro (whole base image as reference).
     """
-    _require_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE, "style")  # gate before any work
     info = client.call("document.info")
     W, H = info["width"], info["height"]
     sel = client.call("selection.info")
@@ -243,6 +340,17 @@ def style(client: BridgeClient, prompt: str, *, negative: str = "",
         x0, y0, rw, rh = 0, 0, W, H
         mask = Image.new("L", (rw, rh), 255)   # whole layer
         scope = "layer"
+
+    if engine == "nanobanana":
+        base_full = _b64_to_img(client.call("image.get")["png_b64"]).convert("RGBA")
+        refs = _nano_refs(client, ref_layers, ref_files, W, H)
+        nano = _nano_generate(_nano_prompt("style", prompt), base_full, refs, nano_model, (W, H))
+        _nano_apply_region(client, nano, x=x0, y=y0, w=rw, h=rh, mask_L=mask,
+                           review_name=("nano banana (raw)" if review else None))
+        return {"mode": "style", "engine": "nanobanana", "scope": scope,
+                "x": x0, "y": y0, "w": rw, "h": rh}
+
+    _require_image_mode(DIFFUSION_SERVICE, INPAINT_SERVICE, "style")  # gate before any work
     init = _b64_to_img(client.call("layer.get_region", x=x0, y=y0, w=rw, h=rh)["png_b64"]).convert("RGBA")
     out = _generate(init, mask, prompt, negative, model, steps, cfg, strength, seed,
                     img_cfg=None, lora=lora, url=DIFFUSION_URL)  # base-model img2img
