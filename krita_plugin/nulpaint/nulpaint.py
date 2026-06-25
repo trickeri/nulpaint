@@ -15,6 +15,7 @@ Wire protocol (must match src/nulpaint/config.py):
 
 import base64
 import json
+import re
 import socket
 import threading
 
@@ -599,6 +600,62 @@ def _cmd_layer_set_region(args):
     return {"layer": node.name(), "x": x, "y": y, "w": w, "h": h}
 
 
+def _cmd_layer_list(_args):
+    """List layers top-to-bottom (name, type, depth) — for reference-image pickers."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    out = []
+
+    def walk(node, depth):
+        for child in reversed(node.childNodes()):   # childNodes() is bottom-up; show top first
+            out.append({"name": child.name(), "type": child.type(), "depth": depth})
+            if child.childNodes():
+                walk(child, depth + 1)
+
+    walk(doc.rootNode(), 0)
+    return {"layers": out}
+
+
+def _cmd_layer_add_image(args):
+    """Create a paint layer from an RGBA image (base64 PNG) and place it BELOW the
+    active layer (default) or on top — used to drop a cloud generation in for review.
+    args: png_b64; name; place ('below_active'|'top'); x, y (offset, default 0)."""
+    QImage, QByteArray, _QBuf, _wo, fmt_argb, _ = _qt_imaging()
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    _require_rgba8(doc)
+    img = QImage()
+    if not img.loadFromData(base64.b64decode(args["png_b64"]), "PNG"):
+        raise RuntimeError("could not decode PNG payload")
+    img = img.convertToFormat(fmt_argb)
+    w, h = img.width(), img.height()
+
+    node = doc.createNode(args.get("name") or "nulpaint gen", "paintlayer")
+    active = doc.activeNode()
+    parent = (active.parentNode() if active else None) or doc.rootNode()
+    above = None
+    if args.get("place", "below_active") == "below_active" and active is not None:
+        # childNodes() and Node.index() share ordering (0 = bottom). The sibling
+        # directly below active is at index-1; inserting our node ABOVE that sibling
+        # lands it directly below active. (active at the bottom -> top fallback.)
+        sibs = parent.childNodes()
+        ai = active.index()
+        if 0 < ai <= len(sibs):
+            above = sibs[ai - 1]
+    parent.addChildNode(node, above)
+
+    x, y = int(args.get("x", 0)), int(args.get("y", 0))
+    n = img.sizeInBytes() if hasattr(img, "sizeInBytes") else img.byteCount()
+    ptr = img.constBits()
+    ptr.setsize(n)
+    node.setPixelData(QByteArray(bytes(ptr)), x, y, w, h)
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"layer": node.name(), "x": x, "y": y, "w": w, "h": h}
+
+
 # --- subject-select (mask from a mattemodel/segmodel service -> selection) ---
 def _cmd_image_get(_args):
     """Base64 PNG of the merged visible image (projection) — the matte input."""
@@ -750,6 +807,155 @@ def _cmd_vector_add_svg(args):
             "shapes_before": before, "shapes_after": after}
 
 
+# --- node tree / visibility / text editing / export -------------------------
+# Used by the stream-schedule automation skill. Nodes are addressed by either
+# `uuid` (stable across text edits) or `path` (list of names from the document
+# root, e.g. ["WeekdayPanels", "Online", "Wednesday"]) which disambiguates the
+# many duplicate-named day groups.
+
+def _resolve_node(doc, args):
+    want_uuid = args.get("uuid")
+    if want_uuid:
+        for n in _walk_nodes(doc.rootNode()):
+            if _node_uuid(n) == want_uuid:
+                return n
+        return None
+    path = args.get("path")
+    if path:
+        cur = doc.rootNode()
+        for name in path:
+            nxt = None
+            for c in cur.childNodes():
+                if c.name() == name:
+                    nxt = c
+                    break
+            if nxt is None:
+                return None
+            cur = nxt
+        return cur
+    return None
+
+
+def _layer_text(node):
+    """Concatenated tspan text of a vector layer (None for non-vector nodes)."""
+    if node.type() != "vectorlayer":
+        return None
+    try:
+        svg = node.toSvg()
+    except Exception:
+        return None
+    return "".join(re.findall(r'>([^<]*)</tspan>', svg)).strip()
+
+
+def _xml_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _node_to_dict(node, depth, maxdepth, want_text):
+    d = {"name": node.name(), "uuid": _node_uuid(node),
+         "type": node.type(), "visible": bool(node.visible())}
+    if want_text and node.type() == "vectorlayer":
+        d["text"] = _layer_text(node)
+    if depth < maxdepth:
+        d["children"] = [_node_to_dict(c, depth + 1, maxdepth, want_text)
+                         for c in node.childNodes()]
+    return d
+
+
+def _cmd_node_tree(args):
+    """Nested layer tree {name,uuid,type,visible,text?,children}. Optional
+    `uuid`/`path` to start from a subtree, `depth` cap, `text` toggle."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    maxdepth = int(args.get("depth", 99))
+    want_text = args.get("text", True)
+    if args.get("uuid") or args.get("path"):
+        start = _resolve_node(doc, args)
+        if start is None:
+            raise RuntimeError("start node not found")
+        roots = [start]
+    else:
+        roots = list(doc.rootNode().childNodes())
+    return {"tree": [_node_to_dict(n, 0, maxdepth, want_text) for n in roots]}
+
+
+def _cmd_node_set_visible(args):
+    """Show/hide a node by uuid or path. Used to flip a day's Online/Offline
+    group and to switch between the main and Twitch panel sets."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_node(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    node.setVisible(bool(args.get("visible", True)))
+    if args.get("refresh", True):
+        doc.refreshProjection()
+    return {"uuid": _node_uuid(node), "name": node.name(),
+            "visible": bool(node.visible())}
+
+
+def _cmd_text_set(args):
+    """Replace the text of a single-line vector text layer (by uuid or path),
+    preserving font/style/transform. Round-trips the layer's own SVG and swaps
+    only the tspan content, then refreshes."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_node(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    if node.type() != "vectorlayer":
+        raise RuntimeError("not a vector layer: %s" % node.type())
+    new_text = args.get("text")
+    if new_text is None:
+        raise RuntimeError("missing 'text'")
+    svg = node.toSvg()
+    tspans = re.findall(r'>([^<]*)</tspan>', svg)
+    if len(tspans) == 0:
+        raise RuntimeError("layer has no text shape")
+    if len(tspans) != 1:
+        raise RuntimeError("layer has %d text spans; only single-line supported"
+                           % len(tspans))
+    old = tspans[0].strip()
+    new_svg = re.sub(r'(>)[^<]*(</tspan>)',
+                     lambda m: m.group(1) + _xml_escape(new_text) + m.group(2),
+                     svg, count=1)
+    for sh in node.shapes():
+        sh.remove()
+    node.addShapesFromSvg(new_svg)
+    if args.get("refresh", True):
+        doc.refreshProjection()
+    return {"uuid": _node_uuid(node), "name": node.name(),
+            "old": old, "new": new_text}
+
+
+def _cmd_document_export_png(args):
+    """Export the merged image to a PNG path (does not change the doc's URL)."""
+    from krita import InfoObject  # type: ignore
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    path = args.get("path")
+    if not path:
+        raise RuntimeError("missing 'path'")
+    doc.refreshProjection()
+    doc.waitForDone()
+    # Force batchmode so exportImage doesn't pop the interactive PNG-options
+    # dialog (which blocks the GUI thread and hangs the bridge).
+    prev_batch = doc.batchmode()
+    doc.setBatchmode(True)
+    try:
+        cfg = InfoObject()
+        cfg.setProperty("compression", 3)
+        cfg.setProperty("alpha", False)
+        ok = doc.exportImage(path, cfg)
+    finally:
+        doc.setBatchmode(prev_batch)
+    return {"ok": bool(ok), "path": path}
+
+
 COMMANDS = {
     "ping": _cmd_ping,
     "document.info": _cmd_document_info,
@@ -766,6 +972,8 @@ COMMANDS = {
     "edit.undo": _cmd_edit_undo,
     "selection.info": _cmd_selection_info,
     "layer.get_region": _cmd_layer_get_region,
+    "layer.list": _cmd_layer_list,
+    "layer.add_image": _cmd_layer_add_image,
     "selection.mask_region": _cmd_selection_mask_region,
     "layer.set_region": _cmd_layer_set_region,
     "image.get": _cmd_image_get,
@@ -773,6 +981,10 @@ COMMANDS = {
     "selection.set_from_mask": _cmd_selection_set_from_mask,
     "vector.list": _cmd_vector_list,
     "vector.add_svg": _cmd_vector_add_svg,
+    "node.tree": _cmd_node_tree,
+    "node.set_visible": _cmd_node_set_visible,
+    "text.set": _cmd_text_set,
+    "document.export_png": _cmd_document_export_png,
 }
 
 
