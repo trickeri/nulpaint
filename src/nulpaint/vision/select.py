@@ -62,11 +62,48 @@ def _matte(service_url: str, png_bytes: bytes, timeout: float = 60.0) -> bytes:
         return resp.read()
 
 
-def select_subject(client: BridgeClient, kind: str = "person") -> dict:
+def fill_mask_holes(mask_png: bytes) -> bytes:
+    """Fill fully-enclosed interior holes in a grayscale subject mask.
+
+    The matte/seg services sometimes punch transparent "islands" inside an
+    otherwise solid subject (a dark patch the salient-object model misreads as
+    background), which then has to be repainted by hand. This solidifies any hole
+    that is *completely surrounded* by subject — every enclosed interior pixel goes
+    fully opaque — while leaving the subject's OUTER anti-aliased silhouette
+    untouched (so edges stay soft, only interior islands are closed). A hole that
+    touches the subject's outline (an open notch, not an island) is left alone.
+    Takes and returns PNG bytes; a no-op mask is returned unchanged.
+    """
+    import io
+    import numpy as np
+    import cv2
+    from PIL import Image
+
+    m = np.asarray(Image.open(io.BytesIO(mask_png)).convert("L"))
+    binary = (m >= 128).astype(np.uint8)
+    if binary.max() == 0:
+        return mask_png                                   # empty mask — nothing to fill
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros(binary.shape, np.uint8)
+    cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+    holes = (filled == 1) & (binary == 0)                 # enclosed interior, sub-threshold
+    if not holes.any():
+        return mask_png
+    out = m.copy()
+    out[holes] = 255
+    buf = io.BytesIO()
+    Image.fromarray(out, "L").save(buf, "PNG")
+    return buf.getvalue()
+
+
+def select_subject(client: BridgeClient, kind: str = "person",
+                   fill_holes: bool = True) -> dict:
     """Select the subject in the active document.
 
     kind: "person" → mattemodel (RVM human matte);
           "object" → segmodel (salient-object: BiRefNet@cuda / U2Net@vulkan).
+    fill_holes (default on): close any transparent islands fully enclosed by the
+    subject so the selection has no interior gaps (see fill_mask_holes).
     Returns the applied selection's bounds.
     """
     url = SEGMODEL_URL if kind == "object" else MATTEMODEL_URL
@@ -75,6 +112,8 @@ def select_subject(client: BridgeClient, kind: str = "person") -> dict:
     img = client.call("image.get")                       # {w, h, png_b64}
     canvas_png = base64.b64decode(img["png_b64"])
     mask_png = _matte(url, canvas_png)
+    if fill_holes:
+        mask_png = fill_mask_holes(mask_png)
     res = client.call(
         "selection.set_from_mask",
         png_b64=base64.b64encode(mask_png).decode("ascii"),
@@ -84,14 +123,19 @@ def select_subject(client: BridgeClient, kind: str = "person") -> dict:
 
 def segment_layers(client: BridgeClient, kind: str = "object",
                    suffix: str = " (cut)", on_white: bool = True,
-                   limit: int = 0) -> list:
-    """Run subject segmentation on EVERY paint layer and add a trimmed copy per layer.
+                   limit: int = 0, only: list | None = None,
+                   beside: bool = True, fill_holes: bool = True) -> list:
+    """Run subject segmentation on paint layers and add a trimmed copy per layer.
 
     Non-destructive: each source paint layer is left UNTOUCHED (the backup); a new
     '<name><suffix>' layer is added whose alpha = the layer's existing alpha × the seg
     mask — so it only ever *removes* background, never adds. Group layers and empty
     layers are skipped. `limit` (>0) processes only the first N paint layers (for a
-    quick quality check before the full run). Returns a per-layer status report.
+    quick quality check before the full run). `only` (a list of layer names) scopes
+    the run to just those layers — anywhere in the stack, including inside groups.
+    `beside` (default) drops each cut directly BELOW its source (so it stays in the
+    same group, original-above-cut); set False to push cuts to the document top.
+    Returns a per-layer status report.
     """
     import io
     from PIL import Image, ImageChops
@@ -109,9 +153,11 @@ def segment_layers(client: BridgeClient, kind: str = "object",
     for L in layers:
         if L.get("type") != "paintlayer":
             continue
+        name = L["name"]
+        if only is not None and name not in only:
+            continue
         if limit and done >= limit:
             break
-        name = L["name"]
         if name.endswith(suffix):
             continue   # this IS a cut layer (e.g. a prior run) — never re-cut it
         if (name + suffix) in existing:
@@ -131,6 +177,8 @@ def segment_layers(client: BridgeClient, kind: str = "object",
             buf = io.BytesIO()
             comp.save(buf, "PNG")
             mask_png = _matte(url, buf.getvalue())
+            if fill_holes:
+                mask_png = fill_mask_holes(mask_png)       # close interior islands
             mask = Image.open(io.BytesIO(mask_png)).convert("L")
             if mask.size != (W, H):
                 mask = mask.resize((W, H))
@@ -139,9 +187,15 @@ def segment_layers(client: BridgeClient, kind: str = "object",
             cut.putalpha(ImageChops.multiply(rgba.getchannel("A"), mask))
             out = io.BytesIO()
             cut.save(out, "PNG")
+            if beside:
+                # land the cut directly below its source (same group, PS-style pair)
+                client.call("node.set_active", node=name)
+                place = "below_active"
+            else:
+                place = "top"
             client.call("layer.add_image", name=name + suffix,
                         png_b64=base64.b64encode(out.getvalue()).decode("ascii"),
-                        place="top")
+                        place=place)
             report.append({"layer": name, "status": "ok"})
             done += 1
         except Exception as e:  # noqa: BLE001 — keep going; report per-layer

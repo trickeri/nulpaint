@@ -262,7 +262,7 @@ def cmd_select_subject(a: argparse.Namespace) -> None:
     from .vision import select_subject
     kind = "object" if a.object else "person"
     with _connect(a.wait) as c:
-        res = select_subject(c, kind)
+        res = select_subject(c, kind, fill_holes=a.fill_holes)
     print(f"nulpaint: selected {res['kind']} via {res['service']} "
           f"({res['w']}x{res['h']})")
 
@@ -275,14 +275,48 @@ def _nano_kwargs(a: argparse.Namespace) -> dict:
 def cmd_segment_layers(a: argparse.Namespace) -> None:
     from .vision.select import segment_layers
     kind = "person" if a.person else "object"
+    only = [s.strip() for s in a.layers.split(",") if s.strip()] if a.layers else None
     with _connect(a.wait) as c:
-        rep = segment_layers(c, kind=kind, suffix=a.suffix, limit=a.limit)
+        rep = segment_layers(c, kind=kind, suffix=a.suffix, limit=a.limit, only=only,
+                             fill_holes=a.fill_holes)
     ok = [r for r in rep if r["status"] == "ok"]
     print(f"nulpaint: segmented {len(ok)}/{len(rep)} paint layers (kind={kind}) "
           f"-> added '<name>{a.suffix}' layers")
     for r in rep:
         if r["status"] != "ok":
             print(f"  - {r['layer']}: {r['status']}")
+
+
+def _find_group(c: BridgeClient, name: str) -> str | None:
+    """uuid of the first top-level group layer named `name`, or None."""
+    for t in c.call("node.tree")["tree"]:
+        if t["name"] == name and t["type"] == "grouplayer":
+            return t["uuid"]
+    return None
+
+
+def cmd_import_image(a: argparse.Namespace) -> None:
+    import base64
+    paths = [Path(p).expanduser() for p in a.paths]
+    for p in paths:
+        if not p.is_file():
+            sys.exit(f"nulpaint: no such file: {p}")
+    with _connect(a.wait) as c:
+        group_uuid = None
+        if a.group:
+            group_uuid = _find_group(c, a.group)
+            if group_uuid is None:
+                group_uuid = c.call("node.create_group", name=a.group)["uuid"]
+                print(f"nulpaint: created group '{a.group}'")
+        for p in paths:
+            name = a.name if (a.name and len(paths) == 1) else p.stem
+            b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+            r = c.call("layer.add_image", name=name, png_b64=b64, place=a.place)
+            if group_uuid:
+                c.call("node.move", node=r["uuid"] if "uuid" in r else r["layer"],
+                       parent=group_uuid)
+            print(f"nulpaint: imported '{r['layer']}' {r['w']}x{r['h']}"
+                  + (f" -> group '{a.group}'" if a.group else ""))
 
 
 def cmd_inpaint(a: argparse.Namespace) -> None:
@@ -433,12 +467,30 @@ def build_parser() -> argparse.ArgumentParser:
     psl.add_argument("--suffix", default=" (cut)", help="name suffix for the added cut layers")
     psl.add_argument("--limit", type=int, default=0,
                      help="only process the first N paint layers (0 = all) — for a quick test")
+    psl.add_argument("--layers", default=None,
+                     help="comma-separated layer names to scope the run to (anywhere in "
+                          "the stack, incl. inside groups); default = every paint layer")
+    psl.add_argument("--no-fill-holes", action="store_false", dest="fill_holes", default=True,
+                     help="keep transparent islands enclosed by the subject (default: fill them)")
     psl.set_defaults(func=cmd_segment_layers)
+
+    pim = sub.add_parser("import-image",
+                         help="import image file(s) as paint layer(s), optionally into a group")
+    pim.add_argument("paths", nargs="+", help="image file(s) to import")
+    pim.add_argument("--name", default=None,
+                     help="layer name (single file only; default = file stem)")
+    pim.add_argument("--group", default=None,
+                     help="add the layer(s) into this group (found by name, created if absent)")
+    pim.add_argument("--place", default="top", choices=["top", "below_active"],
+                     help="where to drop each new layer (default top)")
+    pim.set_defaults(func=cmd_import_image)
 
     pss = sub.add_parser("select-subject",
                          help="select the subject via the matte/seg services")
     pss.add_argument("--object", action="store_true",
                      help="arbitrary object (segmodel) instead of a person (mattemodel)")
+    pss.add_argument("--no-fill-holes", action="store_false", dest="fill_holes", default=True,
+                     help="keep transparent islands enclosed by the subject (default: fill them)")
     pss.set_defaults(func=cmd_select_subject)
 
     pmode = sub.add_parser("mode", help="pre-load the SDXL checkpoint for an image-model mode")
