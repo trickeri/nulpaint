@@ -1078,6 +1078,126 @@ def _cmd_document_export_png(args):
     return {"ok": bool(ok), "path": path}
 
 
+# --- vector layer FX (stroke/fill/opacity) ----------------------------------
+# Read/rewrite the SVG styling of vector layers. `vector.set_style` is the
+# general "alter layer fx" verb: it edits presentation properties in place on a
+# vector layer, or on every vector layer under a group, round-tripping each
+# layer's own SVG so text/font/transform are preserved (same proven mechanism
+# as text.set). Properties map to SVG presentation attrs/style props.
+
+_STYLE_PROPS = {
+    "stroke_width": "stroke-width",
+    "stroke": "stroke",
+    "stroke_opacity": "stroke-opacity",
+    "fill": "fill",
+    "fill_opacity": "fill-opacity",
+    "opacity": "opacity",
+}
+
+
+def _vector_layers_in_scope(node):
+    """Yield the node itself if it's a vector layer, else every descendant
+    vector layer (depth-first)."""
+    if node.type() == "vectorlayer":
+        yield node
+        return
+    for c in node.childNodes():
+        yield from _vector_layers_in_scope(c)
+
+
+def _svg_set_prop(svg, prop, value):
+    """Set SVG presentation property `prop` to `value` wherever it already
+    appears, both as an XML attribute (prop="...") and inside an inline
+    style="..." (prop:...). `\\b...\\s*[=:]` keeps 'stroke' from matching
+    'stroke-width' etc. Returns (new_svg, n_changes)."""
+    value = str(value)
+    pat = re.escape(prop)
+    svg, c1 = re.subn(r'(\b%s\s*=\s*")[^"]*"' % pat,
+                      lambda m: m.group(1) + value + '"', svg)
+    svg, c2 = re.subn(r'(\b%s\s*:\s*)[^;"\']*' % pat,
+                      lambda m: m.group(1) + value, svg)
+    return svg, c1 + c2
+
+
+def _cmd_vector_get_svg(args):
+    """Return the raw SVG of a vector layer (uuid|path|name|node). The read side
+    of the vector-FX commands — lets a caller inspect styling before editing."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    if node.type() != "vectorlayer":
+        raise RuntimeError("not a vector layer: %s" % node.type())
+    return {"uuid": _node_uuid(node), "name": node.name(), "svg": node.toSvg()}
+
+
+def _cmd_vector_set_svg(args):
+    """Replace ALL shapes in a vector layer with the given `svg` (remove +
+    addShapesFromSvg). Low-level write primitive behind the FX helpers."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    if node.type() != "vectorlayer":
+        raise RuntimeError("not a vector layer: %s" % node.type())
+    svg = args.get("svg")
+    if not svg:
+        raise RuntimeError("missing 'svg'")
+    try:
+        before = len(node.shapes())
+    except Exception:
+        before = -1
+    for sh in node.shapes():
+        sh.remove()
+    node.addShapesFromSvg(svg)
+    try:
+        after = len(node.shapes())
+    except Exception:
+        after = -1
+    if args.get("refresh", True):
+        doc.refreshProjection()
+    return {"uuid": _node_uuid(node), "name": node.name(),
+            "shapes_before": before, "shapes_after": after}
+
+
+def _cmd_vector_set_style(args):
+    """Alter presentation FX on a vector layer, or on every vector layer under a
+    group (uuid|path|name|node). Accepts any of: stroke_width, stroke,
+    stroke_opacity, fill, fill_opacity, opacity. Paint values are SVG strings
+    ('none', '#000000', ...). Rewrites each layer's own SVG so text/font/
+    transform are preserved. Reports per-layer change counts."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    edits = {prop: args[key] for key, prop in _STYLE_PROPS.items()
+             if args.get(key) is not None}
+    if not edits:
+        raise RuntimeError("no style props given (stroke_width/stroke/fill/...)")
+    results = []
+    for vl in _vector_layers_in_scope(node):
+        svg = vl.toSvg()
+        total = 0
+        for prop, val in edits.items():
+            svg, c = _svg_set_prop(svg, prop, val)
+            total += c
+        if total:
+            for sh in vl.shapes():
+                sh.remove()
+            vl.addShapesFromSvg(svg)
+        results.append({"uuid": _node_uuid(vl), "name": vl.name(),
+                        "changes": total})
+    if args.get("refresh", True):
+        doc.refreshProjection()
+    return {"target": node.name(), "edits": edits, "layers": results}
+
+
 COMMANDS = {
     "ping": _cmd_ping,
     "document.info": _cmd_document_info,
@@ -1103,6 +1223,9 @@ COMMANDS = {
     "selection.set_from_mask": _cmd_selection_set_from_mask,
     "vector.list": _cmd_vector_list,
     "vector.add_svg": _cmd_vector_add_svg,
+    "vector.get_svg": _cmd_vector_get_svg,
+    "vector.set_svg": _cmd_vector_set_svg,
+    "vector.set_style": _cmd_vector_set_style,
     "node.tree": _cmd_node_tree,
     "node.set_visible": _cmd_node_set_visible,
     "node.move": _cmd_node_move,
