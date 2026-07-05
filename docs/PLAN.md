@@ -23,8 +23,10 @@ branch), in service of a Photoshop-style workflow.
 - [x] In-Krita socket server + GUI-thread dispatcher.
 - [x] External `BridgeClient`.
 - [x] End-to-end smoke test: external `ping` → Krita → `pong` (2026-06-16).
-- [~] Flesh out the command table — done: `document.create`, `document.save`,
-      `layer.add`, `shape.draw`. Still to add: selections, transforms.
+- [x] Flesh out the command table — **38 verbs live** as of 2026-06-30 (full
+      enumeration in the `/krita` skill §6.5): document.*, layer.*, node.*,
+      selection.*, image.*, vector.*, text.set, tool.brush_stroke, app.*, edit.undo.
+      Selections, layer/node management, vector/text, and AI in/out all landed.
 
 ## Phase 2 — Fast voice path
 

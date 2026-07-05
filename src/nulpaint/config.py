@@ -13,6 +13,11 @@ import os
 # Loopback only. The in-Krita server binds here; the external client connects.
 BRIDGE_HOST = os.environ.get("NULPAINT_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("NULPAINT_PORT", "8765"))
+# Multiple Krita windows can each serve a bridge on their own port. Every running
+# instance writes <port>.json here (pid/host/port); `nulpaint instances` lists
+# them. The plugin half copies this path (it can't import this module).
+INSTANCE_DIR = os.path.expanduser(
+    os.environ.get("NULPAINT_INSTANCE_DIR", "~/.local/share/nulpaint/instances"))
 
 # --- Wire protocol ----------------------------------------------------------
 # Newline-delimited JSON. One request object per line, one response per line.

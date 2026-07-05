@@ -32,6 +32,14 @@ import time
 from pathlib import Path
 
 from .bridge import BridgeClient, BridgeError
+from .config import BRIDGE_PORT, INSTANCE_DIR
+
+
+def _current_port() -> int:
+    """The bridge port to talk to: --port (mirrored into $NULPAINT_PORT by main)
+    else $NULPAINT_PORT else the 8765 default. Re-read per call so `--port` and a
+    per-shell env both work."""
+    return int(os.environ.get("NULPAINT_PORT", str(BRIDGE_PORT)))
 
 # --- document presets -------------------------------------------------------
 # Krita's Python API has no "named built-in preset" call, so a preset here is
@@ -119,12 +127,15 @@ def remove_no_focus_rule() -> None:
     _kwin_reconfigure()
 
 
-def _connect(timeout: float) -> BridgeClient:
-    """Connect to the in-Krita server, retrying until Krita is ready."""
+def _connect(timeout: float, sock_timeout: float = 5.0) -> BridgeClient:
+    """Connect to the in-Krita server, retrying until Krita is ready.
+
+    `sock_timeout` bounds each command's round-trip — raise it for slow ops like
+    animation-frame import (hundreds of PNGs loaded on Krita's GUI thread)."""
     deadline = time.monotonic() + timeout
     last: Exception | None = None
     while time.monotonic() < deadline:
-        c = BridgeClient()
+        c = BridgeClient(port=_current_port(), timeout=sock_timeout)
         try:
             c.connect()
             return c
@@ -138,7 +149,7 @@ def _bridge_up() -> bool:
     """Quick one-shot probe: is the in-Krita bridge already reachable? Used by
     `new` to decide whether it must launch Krita first (avoids waiting the full
     --wait timeout when Krita simply isn't running yet)."""
-    c = BridgeClient()
+    c = BridgeClient(port=_current_port())
     try:
         c.connect()
     except OSError:
@@ -154,9 +165,69 @@ def cmd_launch(a: argparse.Namespace) -> None:
         print("nulpaint: KWin no-focus rule active for 'krita'")
     binary = _krita_binary(a.krita)
     argv = [binary] + (["--nosplash"] if a.no_splash else [])
-    subprocess.Popen(argv, start_new_session=True,
+    # `launch --port N` (dest launch_port) or the global `--port N` both work.
+    port = a.launch_port if a.launch_port is not None else getattr(a, "port", None)
+    env = os.environ.copy()
+    # A distinct port makes this a SEPARATE Krita process (own instance key, see
+    # main.cc) serving its own bridge — so multiple windows can run at once, each
+    # driven by its own CLI/Claude. No --port => the default single instance.
+    if port:
+        env["NULPAINT_PORT"] = str(port)
+    subprocess.Popen(argv, start_new_session=True, env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"nulpaint: launched {binary} (pid detached)")
+    where = f" on port {port}" if port else ""
+    print(f"nulpaint: launched {binary}{where} (pid detached)")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def cmd_instances(_a: argparse.Namespace) -> None:
+    """List running Krita bridges (one per window). Prunes dead registry files."""
+    try:
+        names = sorted(os.listdir(INSTANCE_DIR))
+    except OSError:
+        names = []
+    rows = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(INSTANCE_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                info = json.load(fh)
+        except (OSError, ValueError):
+            info = {}
+        pid, port = info.get("pid"), info.get("port")
+        if pid is None or not _pid_alive(pid):
+            try:
+                os.remove(path)          # stale — its Krita is gone
+            except OSError:
+                pass
+            continue
+        doc = "?"
+        try:
+            c = BridgeClient(port=port, timeout=2.0)
+            c.connect()
+            try:
+                d = c.active_document()
+                doc = (d or {}).get("fileName") or (d or {}).get("name") or "(no document)"
+            finally:
+                c.close()
+        except OSError:
+            doc = "(not responding)"
+        rows.append((port, pid, doc))
+    if not rows:
+        print("nulpaint: no running Krita bridges")
+        return
+    print(f"{'PORT':<7}{'PID':<9}DOCUMENT")
+    for port, pid, doc in rows:
+        print(f"{port:<7}{pid:<9}{doc}")
 
 
 def cmd_ping(_a: argparse.Namespace) -> None:
@@ -265,6 +336,183 @@ def cmd_select_subject(a: argparse.Namespace) -> None:
         res = select_subject(c, kind, fill_holes=a.fill_holes)
     print(f"nulpaint: selected {res['kind']} via {res['service']} "
           f"({res['w']}x{res['h']})")
+
+
+ANIM_ROOT = "/mnt/storage1/Pictures/Nuldrums/StreamToons/Animations"
+
+
+def cmd_build_anim_doc(a: argparse.Namespace) -> None:
+    from .anim import build_anim_doc
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    out = a.out or os.path.join(src, f"{a.char}.kra")
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    canvas = tuple(int(v) for v in a.canvas.split("x")) if a.canvas else None
+    # Frame import loads hundreds of PNGs on Krita's GUI thread -> long socket timeout.
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = build_anim_doc(c, char=a.char, src_dir=src, out_path=out,
+                             only=only, fps=a.fps, canvas=canvas)
+    print(f"nulpaint: built {res['out']}  ({res['canvas'][0]}x{res['canvas'][1]} "
+          f"@ {res['fps']}fps)")
+    for cl in res["clips"]:
+        flag = "" if cl["animated"] else "  [NOT ANIMATED!]"
+        print(f"  - {cl['anim']}: {cl['frames']} frames (src {cl['src_fps']}fps){flag}")
+
+
+def cmd_punch_anim(a: argparse.Namespace) -> None:
+    from .anim import punch_anim_frames
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    # Hundreds of per-frame set_frame + filter.apply round-trips -> long socket timeout.
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = punch_anim_frames(c, char=a.char, src_dir=src, only=only,
+                                saturation=a.saturation, value=a.value,
+                                black=a.black, white=a.white, gamma=a.gamma)
+    total = sum(cl["frames"] for cl in res["clips"])
+    print(f"nulpaint: punched {total} frames across {len(res['clips'])} "
+          f"{a.char} animations (sat+{a.saturation})")
+    for cl in res["clips"]:
+        print(f"  - {cl['anim']}: {cl['frames']} frames")
+
+
+def cmd_open(a: argparse.Namespace) -> None:
+    path = str(Path(a.path).expanduser().resolve())
+    with _connect(a.wait) as c:
+        r = c.call("document.open", path=path)
+    verb = "activated (already open)" if r.get("reused") else "opened"
+    print(f"nulpaint: {verb} {r['fileName']}  ({r['width']}x{r['height']})")
+
+
+def cmd_export_chibi(a: argparse.Namespace) -> None:
+    from .chibi import export_chibi
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = export_chibi(c, layer_base=a.layer, exp_name=a.name or a.layer,
+                           mask=a.mask, nobg_only=a.nobg_only, keep_aspect=a.keep_aspect)
+    print(f"nulpaint: exported Chibi_{res['name']}  (masked={res['masked']}, "
+          f"placement={res['placement']}, backed_up={res['backed_up']}/3)  "
+          f"native_bbox={res['native_bbox']} padded_bbox={res['padded_bbox']}")
+
+
+def cmd_export_object(a: argparse.Namespace) -> None:
+    from .chibi import export_object
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = export_object(c, layer_base=a.layer, exp_name=a.name or a.layer,
+                            mask=a.mask, game_dir=a.game_dir)
+    extra = f" + {res['game_out']}" if res['game_out'] else ""
+    print(f"nulpaint: exported {res['name']}.png -> {res['out']}{extra}  "
+          f"(masked={res['masked']}, bbox={res['bbox']}, backed_up={res['backed_up']})")
+
+
+def cmd_rebuild_clip(a: argparse.Namespace) -> None:
+    from .anim import rebuild_clip
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = rebuild_clip(c, char=a.char, src_dir=src, anim=a.anim,
+                           from_bak=not a.from_mov)
+    print(f"nulpaint: rebuilt {a.char}/{res['anim']} from {res['source']} "
+          f"({res['frames']} frames)")
+
+
+def cmd_apply_filter_anim(a: argparse.Namespace) -> None:
+    import json
+    from .anim import apply_filter_anim_frames
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    cfg = json.loads(Path(a.config_file).read_text()) if a.config_file else json.loads(a.config)
+    # accept either a raw config dict, or the full {"filter","config"} from read_config
+    filt = a.filter or cfg.get("filter")
+    if isinstance(cfg, dict) and "config" in cfg and "filter" in cfg:
+        filt, cfg = cfg["filter"], cfg["config"]
+    if not filt:
+        sys.exit("nulpaint: need --filter (or a read_config JSON with a 'filter' key)")
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = apply_filter_anim_frames(c, char=a.char, src_dir=src, filter_id=filt,
+                                       config=cfg, only=only)
+    total = sum(cl["frames"] for cl in res["clips"])
+    print(f"nulpaint: baked '{filt}' into {total} frames across {len(res['clips'])} "
+          f"{a.char} animations")
+
+
+def cmd_despill_anim(a: argparse.Namespace) -> None:
+    from .anim import despill_anim_frames
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = despill_anim_frames(c, char=a.char, src_dir=src, only=only,
+                                  thr=a.thr, edge=a.edge, grow=a.grow)
+    total = sum(cl["px"] for cl in res["clips"])
+    print(f"nulpaint: green-eat edge despill on {a.char}: recoloured {total} px "
+          f"(thr={a.thr} edge={a.edge}px)")
+    for cl in res["clips"]:
+        print(f"  - {cl['anim']}: {cl['recoloured_frames']}/{cl['frames']} frames touched, "
+              f"{cl['px']} px")
+
+
+def cmd_export_anim_doc(a: argparse.Namespace) -> None:
+    from .anim import export_anim_doc
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = export_anim_doc(c, char=a.char, src_dir=src, out_dir=a.out_dir,
+                              only=only, solidify=not a.no_solidify, fps_override=a.fps)
+    print(f"nulpaint: re-exported {a.char} -> {res['out_dir']}  "
+          f"(solidified: {res['solidified']})")
+    for cl in res["clips"]:
+        v = cl["verify"]
+        bak = "  [orig backed up .bak]" if cl["backed_up"] else ""
+        print(f"  - {cl['anim']}: {cl['frames']}f @{cl['fps']}fps -> "
+              f"{os.path.basename(cl['mov'])} + .webm  "
+              f"(opaque {v['opaque_pct']}%, green {v['residual_green_pct']}%){bak}")
+
+
+def cmd_despill_selection(a: argparse.Namespace) -> None:
+    from .despill import despill_selection
+    with _connect(a.wait) as c:
+        res = despill_selection(c, thr=a.thr, grow=a.grow, layer=a.layer)
+    scope = "selection" if res["scoped"] else "whole canvas (no selection)"
+    print(f"nulpaint: green-eat recoloured {res['recoloured']} px over {scope} "
+          f"@({res['x']},{res['y']}) {res['w']}x{res['h']}")
+
+
+def _collect_cut_layers(c: BridgeClient) -> list[tuple[str, str]]:
+    """Every paint layer whose name ends with '(cut)', as (uuid, name)."""
+    out: list[tuple[str, str]] = []
+
+    def walk(node: dict) -> None:
+        if node.get("type") == "paintlayer" and node.get("name", "").rstrip().endswith("(cut)"):
+            out.append((node["uuid"], node["name"]))
+        for child in node.get("children", []):
+            walk(child)
+
+    for top in c.call("node.tree")["tree"]:
+        walk(top)
+    return out
+
+
+def cmd_punch(a: argparse.Namespace) -> None:
+    from .depastel import punch_layer
+    with _connect(a.wait) as c:
+        if a.all_cuts:
+            targets = _collect_cut_layers(c)          # (uuid, name)
+            if not targets:
+                print("nulpaint: no '(cut)' layers found")
+                return
+        elif a.layers:
+            targets = [(None, s.strip()) for s in a.layers.split(",") if s.strip()]
+        else:
+            targets = [(None, None)]                  # active layer
+
+        for uuid, name in targets:
+            ident = uuid or name
+            if a.new_layer:
+                dup_name = f"{name} {a.suffix}" if name else None
+                r = c.call("node.duplicate", node=ident, name=dup_name)
+                ident, label = r["uuid"], r["name"]
+            else:
+                label = name or "(active layer)"
+            punch_layer(c, ident, saturation=a.saturation, value=a.value,
+                        black=a.black, white=a.white, gamma=a.gamma)
+            print(f"nulpaint: punched '{label}' sat+{a.saturation} "
+                  f"val+{a.value} black={a.black} white={a.white} gamma={a.gamma}")
 
 
 def _nano_kwargs(a: argparse.Namespace) -> dict:
@@ -403,6 +651,9 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--wait", type=float, default=20.0,
                    help="seconds to wait for the Krita bridge (default 20)")
+    p.add_argument("--port", type=int, default=None,
+                   help="bridge port to talk to / launch on — selects one Krita "
+                        "instance when several run (default $NULPAINT_PORT or 8765)")
     sub = p.add_subparsers(dest="command", required=True)
 
     pl = sub.add_parser("launch", help="launch the forked Krita")
@@ -410,7 +661,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="install a KWin rule so Krita won't steal focus")
     pl.add_argument("--no-splash", action="store_true", help="suppress the splash screen")
     pl.add_argument("--krita", help="path to the krita binary (default: ~/.local/bin/krita)")
+    pl.add_argument("--port", type=int, default=None, dest="launch_port",
+                    help="start a SEPARATE instance on this bridge port (own window "
+                         "+ own bridge; omit for the default single instance)")
     pl.set_defaults(func=cmd_launch)
+
+    sub.add_parser("instances",
+                   help="list running Krita bridges (one per window) + their docs"
+                   ).set_defaults(func=cmd_instances)
 
     sub.add_parser("ping", help="ping the in-Krita server").set_defaults(func=cmd_ping)
     sub.add_parser("info", help="print active document info").set_defaults(func=cmd_info)
@@ -474,6 +732,30 @@ def build_parser() -> argparse.ArgumentParser:
                      help="keep transparent islands enclosed by the subject (default: fill them)")
     psl.set_defaults(func=cmd_segment_layers)
 
+    ppu = sub.add_parser("punch",
+                         help="de-pastel: bake saturation + contrast into layer(s) "
+                              "(then hand-tune hues via Cross-channel adjustment)")
+    ppu.add_argument("--layers", default=None,
+                     help="comma-separated layer names (uuid or name); default = active layer")
+    ppu.add_argument("--all-cuts", action="store_true", dest="all_cuts",
+                     help="target every paint layer whose name ends with '(cut)'")
+    ppu.add_argument("--new-layer", action="store_true", dest="new_layer",
+                     help="duplicate each target to a new layer and punch the copy "
+                          "(leaves the original untouched)")
+    ppu.add_argument("--suffix", default="nulpaint",
+                     help="name suffix for --new-layer copies (default 'nulpaint')")
+    ppu.add_argument("--saturation", type=int, default=35,
+                     help="HSL saturation boost -100..100 (default 35)")
+    ppu.add_argument("--value", type=int, default=0,
+                     help="HSL value/brightness shift -100..100 (default 0)")
+    ppu.add_argument("--black", type=int, default=18,
+                     help="input black point 0..255 — raise to deepen darks (default 18)")
+    ppu.add_argument("--white", type=int, default=245,
+                     help="input white point 0..255 — lower to brighten highs (default 245)")
+    ppu.add_argument("--gamma", type=float, default=1.0,
+                     help="levels gamma; <1 darkens mids, >1 lightens (default 1.0)")
+    ppu.set_defaults(func=cmd_punch)
+
     pim = sub.add_parser("import-image",
                          help="import image file(s) as paint layer(s), optionally into a group")
     pim.add_argument("paths", nargs="+", help="image file(s) to import")
@@ -484,6 +766,127 @@ def build_parser() -> argparse.ArgumentParser:
     pim.add_argument("--place", default="top", choices=["top", "below_active"],
                      help="where to drop each new layer (default top)")
     pim.set_defaults(func=cmd_import_image)
+
+    pbad = sub.add_parser("build-anim-doc",
+                          help="build a per-character animation-cleanup .kra (group per "
+                               "animation, frames on the timeline) from its _4444.mov clips")
+    pbad.add_argument("char", help="character name, e.g. Trikeri")
+    pbad.add_argument("--src", default=None,
+                      help=f"source folder (default {ANIM_ROOT}/<char>)")
+    pbad.add_argument("--out", default=None, help="output .kra path (default <src>/<char>.kra)")
+    pbad.add_argument("--clips", default=None,
+                      help="comma-separated animation names to include (default: all)")
+    pbad.add_argument("--fps", type=int, default=None, help="override document fps")
+    pbad.add_argument("--canvas", default=None, help="canvas WxH (default: clip dims)")
+    pbad.set_defaults(func=cmd_build_anim_doc)
+
+    ppa = sub.add_parser("punch-anim",
+                         help="bake the de-pastel punch (levels+saturation) into EVERY keyframe "
+                              "of each animation in the OPEN character .kra")
+    ppa.add_argument("char", help="character name, e.g. Magi2")
+    ppa.add_argument("--src", default=None, help=f"source folder (default {ANIM_ROOT}/<char>)")
+    ppa.add_argument("--clips", default=None,
+                     help="comma-separated animation names (default: all)")
+    ppa.add_argument("--saturation", type=int, default=35, help="HSL saturation boost (default 35)")
+    ppa.add_argument("--value", type=int, default=0, help="HSL value shift (default 0)")
+    ppa.add_argument("--black", type=int, default=18, help="input black point 0..255 (default 18)")
+    ppa.add_argument("--white", type=int, default=245, help="input white point 0..255 (default 245)")
+    ppa.add_argument("--gamma", type=float, default=1.0, help="levels gamma (default 1.0)")
+    ppa.set_defaults(func=cmd_punch_anim)
+
+    popen = sub.add_parser("open", help="open a document file in Krita (activates it if already open)")
+    popen.add_argument("path", help="path to the .kra (or any Krita-openable) file")
+    popen.set_defaults(func=cmd_open)
+
+    pec = sub.add_parser("export-chibi",
+                         help="export a chibi character's final art (punch + optional colour mask) "
+                              "from the OPEN ChibiToonEdits.kra to the 3 still deliverables "
+                              "(NoBG, padded, greenscreen), matching existing padding; backs up first")
+    pec.add_argument("layer", help="layer base name in ChibiToonEdits, e.g. WorldSynth3")
+    pec.add_argument("--name", default=None, help="export name (default = layer), e.g. WorldSynths")
+    pec.add_argument("--mask", action="store_true",
+                     help="bake the layer's Cross-channel colour mask into the output")
+    pec.add_argument("--nobg-only", action="store_true", dest="nobg_only",
+                     help="only write the tight NoBG Chibi_<name>.png (skip padded + greenscreen)")
+    pec.add_argument("--keep-aspect", action="store_true", dest="keep_aspect",
+                     help="silhouette changed (e.g. redrawn narrower): keep the reference's "
+                          "height/feet/centre but let padded WIDTH follow the new aspect ratio "
+                          "(don't re-stretch to the old box)")
+    pec.set_defaults(func=cmd_export_chibi)
+
+    peo = sub.add_parser("export-object",
+                         help="export a NON-character object's final '<base> (cut) nulpaint' layer "
+                              "from the OPEN ChibiToonEdits.kra to a plain full-canvas RGBA PNG at "
+                              "OtherImages_NoBG/<name>.png (no chibi padding); backs up existing first")
+    peo.add_argument("layer", help="layer base name in ChibiToonEdits, e.g. BeerKeg")
+    peo.add_argument("--name", default=None, help="export name (default = layer)")
+    peo.add_argument("--mask", action="store_true",
+                     help="bake the layer's Cross-channel colour mask if it has one")
+    peo.add_argument("--game-dir", default=None, dest="game_dir",
+                     help="also copy the PNG into this game Textures dir")
+    peo.set_defaults(func=cmd_export_object)
+
+    prc = sub.add_parser("rebuild-clip",
+                         help="replace one animation clip in the OPEN character .kra with fresh "
+                              "frames from its pristine _4444.mov.bak (then re-run the chain scoped "
+                              "to that clip)")
+    prc.add_argument("char", help="character name, e.g. Cyren3")
+    prc.add_argument("anim", help="animation/clip name, e.g. Idle_Forward")
+    prc.add_argument("--src", default=None, help=f"source folder (default {ANIM_ROOT}/<char>)")
+    prc.add_argument("--from-mov", action="store_true", dest="from_mov",
+                     help="import from the current _4444.mov instead of the pristine .bak")
+    prc.set_defaults(func=cmd_rebuild_clip)
+
+    pafa = sub.add_parser("apply-filter-anim",
+                          help="bake an arbitrary Krita filter (id + config) into every keyframe "
+                               "of each animation in the OPEN character .kra")
+    pafa.add_argument("char", help="character name, e.g. Cyren3")
+    pafa.add_argument("--filter", default=None, help="filter id (e.g. crosschannel); "
+                      "optional if --config-file is a read_config JSON")
+    pafa.add_argument("--config", default="{}", help="filter config as inline JSON")
+    pafa.add_argument("--config-file", default=None, dest="config_file",
+                      help="path to a JSON config (or a full read_config result)")
+    pafa.add_argument("--src", default=None, help=f"source folder (default {ANIM_ROOT}/<char>)")
+    pafa.add_argument("--clips", default=None, help="comma-separated animation names (default: all)")
+    pafa.set_defaults(func=cmd_apply_filter_anim)
+
+    pda = sub.add_parser("despill-anim",
+                         help="green-eat the outer alpha edge of EVERY keyframe of each animation "
+                              "in the OPEN character .kra (run after punch-anim, before re-export)")
+    pda.add_argument("char", help="character name, e.g. LadyVermilia")
+    pda.add_argument("--src", default=None, help=f"source folder (default {ANIM_ROOT}/<char>)")
+    pda.add_argument("--clips", default=None, help="comma-separated animation names (default: all)")
+    pda.add_argument("--thr", type=int, default=22, help="green-dominance threshold (default 22)")
+    pda.add_argument("--edge", type=int, default=8,
+                     help="edge-band width in px just inside the alpha boundary (default 8)")
+    pda.add_argument("--grow", type=int, default=2,
+                     help="dilate the green mask along the soft edge (default 2)")
+    pda.set_defaults(func=cmd_despill_anim)
+
+    pead = sub.add_parser("export-anim-doc",
+                          help="re-export cleaned clips from the OPEN character .kra: timeline "
+                               "-> _4444.mov + .webm, solidify, verify, back up originals")
+    pead.add_argument("char", help="character name, e.g. Trikeri")
+    pead.add_argument("--src", default=None,
+                      help=f"source folder (default {ANIM_ROOT}/<char>)")
+    pead.add_argument("--out-dir", default=None, dest="out_dir",
+                      help="output folder (default = src)")
+    pead.add_argument("--clips", default=None,
+                      help="comma-separated animation names to export (default: all)")
+    pead.add_argument("--no-solidify", action="store_true",
+                      help="skip klingsolidify (use for pure-FX clips; default solidifies)")
+    pead.add_argument("--fps", type=int, default=None, help="override output fps")
+    pead.set_defaults(func=cmd_export_anim_doc)
+
+    pds = sub.add_parser("despill-selection",
+                         help="green-eater: recolour leftover green edge fringe inside the "
+                              "selection from the nearest clean colour (alpha untouched)")
+    pds.add_argument("--thr", type=int, default=22,
+                     help="green-dominance threshold (higher = only stronger green; default 22)")
+    pds.add_argument("--grow", type=int, default=0,
+                     help="extend the recolour this many px along the soft edge (default 0)")
+    pds.add_argument("--layer", default=None, help="layer name (default: active)")
+    pds.set_defaults(func=cmd_despill_selection)
 
     pss = sub.add_parser("select-subject",
                          help="select the subject via the matte/seg services")
@@ -553,6 +956,10 @@ EXIT_MODEL_NOT_LOADED = 10
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    # Mirror --port into the env so _current_port() (and a launched Krita child)
+    # both see it; an explicit --port wins over any inherited $NULPAINT_PORT.
+    if getattr(args, "port", None):
+        os.environ["NULPAINT_PORT"] = str(args.port)
     try:
         args.func(args)
     except BridgeError as e:

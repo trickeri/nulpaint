@@ -13,11 +13,15 @@ Wire protocol (must match src/nulpaint/config.py):
   response: {"id": int, "ok": bool, "result": any, "error": str|null}\n
 """
 
+import atexit
 import base64
 import json
+import os
 import re
 import socket
+import subprocess
 import threading
+import time
 
 from krita import Extension, Krita  # type: ignore
 
@@ -30,12 +34,88 @@ except ImportError:  # pragma: no cover — Qt5 fallback
     from PyQt5.QtCore import QObject, pyqtSignal, Qt  # type: ignore
     _QUEUED = Qt.QueuedConnection
 
-HOST = "127.0.0.1"
-PORT = 8765
+# Loopback bridge. Each Krita instance serves its own socket so multiple windows
+# can run at once, each driven by its own `nulpaint` CLI / Claude. The port comes
+# from $NULPAINT_PORT (set it when launching a 2nd instance, or via
+# `nulpaint launch --port N`). With no env, the FIRST instance takes the default
+# 8765; a second instance whose default is taken auto-picks a free port (see
+# _bind_server). An EXPLICIT $NULPAINT_PORT that's already in use is a hard error
+# (the client is targeting that exact port, so we must not silently move).
+HOST = os.environ.get("NULPAINT_HOST", "127.0.0.1")
+PORT = int(os.environ.get("NULPAINT_PORT", "8765"))
+PORT_EXPLICIT = bool(os.environ.get("NULPAINT_PORT"))
 ENCODING = "utf-8"
+
+# Each running bridge writes <port>.json here so the CLI can discover instances
+# (mirrors NULPAINT_INSTANCE_DIR in config.py — this half can't import it).
+INSTANCE_DIR = os.path.expanduser(
+    os.environ.get("NULPAINT_INSTANCE_DIR", "~/.local/share/nulpaint/instances"))
 
 # Keeps a running synthetic-stroke QTimer alive (would otherwise be GC'd).
 _active_stroke = {}
+
+
+def _pid_alive(pid):
+    """True if a process with this pid exists (used to prune stale registry files)."""
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _prune_instances():
+    """Delete registry files whose owning process is gone."""
+    try:
+        names = os.listdir(INSTANCE_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(INSTANCE_DIR, name)
+        try:
+            with open(path, encoding=ENCODING) as fh:
+                pid = json.load(fh).get("pid")
+        except (OSError, ValueError):
+            pid = None
+        if pid is None or not _pid_alive(pid):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _instance_path(port):
+    return os.path.join(INSTANCE_DIR, "%d.json" % port)
+
+
+def _register_instance(host, port):
+    """Announce this bridge so `nulpaint instances` / the CLI can find it."""
+    try:
+        os.makedirs(INSTANCE_DIR, exist_ok=True)
+        with open(_instance_path(port), "w", encoding=ENCODING) as fh:
+            json.dump({"pid": os.getpid(), "host": host, "port": port,
+                       "started": int(time.time())}, fh)
+    except OSError:
+        pass
+
+
+def _unregister_instance(port):
+    try:
+        os.remove(_instance_path(port))
+    except OSError:
+        pass
+
+
+def _launcher():
+    """Resolve the external `nulpaint` CLI (external venv owns cv2/torch)."""
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for p in (os.path.expanduser("~/.local/bin/nulpaint"),
+              os.path.join(here, "nulpaint")):
+        if os.path.exists(p):
+            return p
+    return "nulpaint"
 
 
 class _GuiDispatcher(QObject):
@@ -941,17 +1021,25 @@ def _cmd_node_move(args):
                   else (node.parentNode() or doc.rootNode()))
     if new_parent is None:
         raise RuntimeError("parent not found: %r" % args.get("parent"))
+    old_parent = node.parentNode() or doc.rootNode()
+    old_parent.removeChildNode(node)               # detach FIRST; wrapper keeps it alive.
+    # Resolve anchors + read siblings AFTER the detach: `node` is no longer in the
+    # tree, so it can never resolve to its own anchor. addChildNode(node, above=node)
+    # silently DROPS the layer when `above` isn't a current child of new_parent, so a
+    # stale self-anchor (e.g. chained reorders) would otherwise lose it entirely.
+    sibs = list(new_parent.childNodes())           # index 0 = bottom; `node` excluded
     above = _resolve_ident(doc, args.get("above")) if args.get("above") else None
     if above is None and args.get("below"):
         below = _resolve_ident(doc, args.get("below"))
         if below is not None:
-            sibs = list(new_parent.childNodes())   # index 0 = bottom
             bi = next((i for i, s in enumerate(sibs)
                        if _node_uuid(s) == _node_uuid(below)), -1)
-            if bi > 0:
-                above = sibs[bi - 1]               # node above this anchor = below `below`
-    old_parent = node.parentNode() or doc.rootNode()
-    old_parent.removeChildNode(node)               # detaches; wrapper keeps it alive
+            above = sibs[bi - 1] if bi > 0 else None   # sit directly below the anchor
+    elif above is None and not args.get("below"):
+        # No anchor: default to the TOP of the parent (per this command's contract).
+        # NB Krita's addChildNode(node, None) appends at the BOTTOM (index 0), so we
+        # must explicitly anchor above the current top sibling to land on top.
+        above = sibs[-1] if sibs else None
     new_parent.addChildNode(node, above)           # re-attach, preserving all props
     doc.refreshProjection()
     doc.waitForDone()
@@ -1053,6 +1141,40 @@ def _cmd_text_set(args):
             "old": old, "new": new_text}
 
 
+def _cmd_document_open(args):
+    """Open a document file and show it in a view/tab. args: path; set_active
+    (default True). If the file is already open, activates that doc instead of
+    opening a duplicate. Returns the doc's info (+ reused flag)."""
+    import os
+    path = args.get("path")
+    if not path:
+        raise RuntimeError("missing 'path'")
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.exists(path):
+        raise RuntimeError("no such file: %s" % path)
+    app = Krita.instance()
+    doc = None
+    for d in app.documents():                    # already open? -> reuse
+        try:
+            if os.path.abspath(d.fileName() or "") == path:
+                doc = d
+                break
+        except Exception:
+            continue
+    reused = doc is not None
+    if doc is None:
+        doc = app.openDocument(path)
+        if doc is None:
+            raise RuntimeError("failed to open: %s" % path)
+        win = app.activeWindow()
+        if win is not None:
+            win.addView(doc)                     # show it in a tab
+    if args.get("set_active", True):
+        app.setActiveDocument(doc)
+    return {"name": doc.name(), "fileName": doc.fileName(),
+            "width": doc.width(), "height": doc.height(), "reused": reused}
+
+
 def _cmd_document_export_png(args):
     """Export the merged image to a PNG path (does not change the doc's URL)."""
     from krita import InfoObject  # type: ignore
@@ -1076,6 +1198,174 @@ def _cmd_document_export_png(args):
     finally:
         doc.setBatchmode(prev_batch)
     return {"ok": bool(ok), "path": path}
+
+
+# --- animation frame import / timeline scrub --------------------------------
+# libkis can ONLY author the animation timeline via Document.importAnimation, which
+# needs a GUI main window (it segfaults headless). So these run in the live-but-
+# bridge-driven Krita: the whole per-character doc build is automated, no manual GUI.
+def _cmd_document_import_animation(args):
+    """Import image files as animation frames onto a NEW animated paint layer.
+
+    args: files (list of abs paths, imported in the given order), first_frame
+    (default 0), step (default 1), name (rename the created layer), fps (set the
+    document fps). Returns the new layer's uuid/name + frame count.
+    importAnimation adds one paint layer to the image root; we diff the root's
+    children to find it (it isn't reliably the active node)."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    files = args.get("files") or []
+    if not files:
+        raise RuntimeError("no files to import")
+    first_frame = int(args.get("first_frame", 0))
+    step = int(args.get("step", 1))
+
+    before = {_node_uuid(n) for n in doc.rootNode().childNodes()}
+    prev_batch = doc.batchmode()
+    doc.setBatchmode(True)                      # no import progress dialog
+    try:
+        ok = doc.importAnimation(list(files), first_frame, step)
+    finally:
+        doc.setBatchmode(prev_batch)
+    if not ok:
+        raise RuntimeError("importAnimation failed")
+
+    new = [n for n in doc.rootNode().childNodes() if _node_uuid(n) not in before]
+    node = new[-1] if new else doc.activeNode()
+    if node is None:
+        raise RuntimeError("could not locate the imported animation layer")
+    if args.get("name"):
+        node.setName(args["name"])
+    if args.get("fps"):
+        doc.setFramesPerSecond(int(args["fps"]))
+    doc.setActiveNode(node)
+    doc.refreshProjection()
+    return {"uuid": _node_uuid(node), "name": node.name(),
+            "frames": len(files), "animated": bool(node.animated())}
+
+
+def _cmd_document_frame_info(_args):
+    """Timeline state: current time, fps, and the full clip range."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    return {"currentTime": doc.currentTime(), "fps": doc.framesPerSecond(),
+            "clipStart": doc.fullClipRangeStartTime(),
+            "clipEnd": doc.fullClipRangeEndTime()}
+
+
+def _cmd_document_set_frame(args):
+    """Scrub the timeline: set the document's current time. args: time."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    doc.setCurrentTime(int(args["time"]))
+    doc.refreshProjection()
+    doc.waitForDone()
+    return {"time": doc.currentTime()}
+
+
+# --- filters (destructive apply of any registered Krita filter) --------------
+# General primitive: apply a named Krita filter (by its registry id, e.g.
+# "hsvadjustment", "levels", "crosschannel") with a property dict onto a node,
+# baking the result into the layer's pixels. Config props are set through the
+# filter's OWN default configuration object, so filter-specific property logic
+# (e.g. the levels legacy blackvalue/whitevalue/gammavalue -> lightness-curve
+# conversion) fires correctly. Region defaults to the whole document.
+def _cmd_node_duplicate(args):
+    """Duplicate a node and insert the copy directly above its source, keeping
+    the same parent group and all layer properties. args: uuid|name|path to
+    address the source, optional `name` for the copy (default "<src> nulpaint"),
+    `set_active` (default True). Returns the new node's uuid/name."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    src = _resolve_target(doc, args)
+    if src is None:
+        raise RuntimeError("node not found")
+    dup = src.duplicate()
+    if dup is None:
+        raise RuntimeError("duplicate failed for: %s" % src.name())
+    dup.setName(args.get("name") or (src.name() + " nulpaint"))
+    parent = src.parentNode() or doc.rootNode()
+    parent.addChildNode(dup, src)          # insert directly above the source
+    if args.get("set_active", True):
+        doc.setActiveNode(dup)
+    if args.get("refresh", True):
+        doc.refreshProjection()
+    return {"uuid": _node_uuid(dup), "name": dup.name(),
+            "source": _node_uuid(src)}
+
+
+def _cmd_filter_read_config(args):
+    """Read the filter id + configuration properties off a filter MASK or filter
+    LAYER node (addressed by uuid|name|path). Returns {filter, config} where config
+    can be fed straight back into filter.apply (or filter.add_mask) to reproduce it
+    exactly — e.g. copying a hand-tuned Cross-channel curve onto other layers/docs."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    getf = getattr(node, "filter", None)
+    if getf is None:
+        raise RuntimeError("node has no filter (type=%s); need a filter mask/layer"
+                           % node.type())
+    flt = getf()
+    if flt is None:
+        raise RuntimeError("no filter on node %s" % node.name())
+    cfg = flt.configuration()
+    raw = cfg.properties()
+    props = {}
+    for k in (raw.keys() if hasattr(raw, "keys") else raw):
+        v = raw[k]
+        if not isinstance(v, (str, int, float, bool)) and v is not None:
+            v = str(v)                    # keep JSON-safe (curves are strings already)
+        props[k] = v
+    return {"filter": flt.name(), "config": props, "node": node.name()}
+
+
+def _cmd_filter_apply(args):
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None and not (args.get("uuid") or args.get("path") or args.get("node")):
+        node = doc.activeNode()          # no identifier given -> active layer
+    if node is None:
+        raise RuntimeError("node not found")
+    fid = args.get("filter")
+    if not fid:
+        raise RuntimeError("missing 'filter' (registry id)")
+    flt = Krita.instance().filter(fid)
+    if flt is None:
+        raise RuntimeError("unknown filter id: %s" % fid)
+    cfg = flt.configuration()
+    config = args.get("config") or {}
+    # Some configs are order-sensitive: multichannel/cross-channel ignore curveN
+    # unless nTransfers (the channel count) is set FIRST. Apply it before the rest.
+    if "nTransfers" in config:
+        cfg.setProperty("nTransfers", config["nTransfers"])
+    for k, v in config.items():
+        if k == "nTransfers":
+            continue
+        cfg.setProperty(k, v)
+    flt.setConfiguration(cfg)
+
+    x = int(args.get("x", 0))
+    y = int(args.get("y", 0))
+    w = int(args.get("w", doc.width()))
+    h = int(args.get("h", doc.height()))
+    if node.locked():
+        raise RuntimeError("node is locked: %s" % node.name())
+    ok = flt.apply(node, x, y, w, h)
+    if args.get("refresh", True):
+        doc.refreshProjection()
+        doc.waitForDone()
+    return {"ok": bool(ok), "uuid": _node_uuid(node), "name": node.name(),
+            "filter": fid}
 
 
 # --- vector layer FX (stroke/fill/opacity) ----------------------------------
@@ -1235,6 +1525,13 @@ COMMANDS = {
     "node.set_active": _cmd_node_set_active,
     "text.set": _cmd_text_set,
     "document.export_png": _cmd_document_export_png,
+    "document.open": _cmd_document_open,
+    "document.import_animation": _cmd_document_import_animation,
+    "document.frame_info": _cmd_document_frame_info,
+    "document.set_frame": _cmd_document_set_frame,
+    "filter.apply": _cmd_filter_apply,
+    "filter.read_config": _cmd_filter_read_config,
+    "node.duplicate": _cmd_node_duplicate,
 }
 
 
@@ -1244,12 +1541,28 @@ class NulPaintExtension(Extension):
         self._dispatcher = _GuiDispatcher()
         self._server = None
         self._thread = None
+        self._port = PORT
 
     def setup(self):
         self._start_server()
 
     def createActions(self, window):
-        pass
+        # "Green-eat Selection": recolour leftover green edge fringe inside the
+        # current lasso from the nearest clean colour (alpha untouched). The math
+        # needs cv2, which lives in the external venv — so we shell the `nulpaint`
+        # CLI, which connects BACK over this socket to pull/write pixels. It MUST
+        # be non-blocking (Popen, no wait): the CLI's get/set calls are serviced
+        # on this same GUI thread, so blocking here would deadlock.
+        act = window.createAction("nulpaint_green_eat", "Green-eat Selection (despill)",
+                                  "tools/scripts")
+        act.triggered.connect(self._green_eat)
+
+    def _green_eat(self):
+        try:
+            subprocess.Popen([_launcher(), "despill-selection"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001 — never let a UI action raise into Krita
+            pass
 
     # -- socket server ------------------------------------------------------
     def _start_server(self):
@@ -1258,12 +1571,37 @@ class NulPaintExtension(Extension):
         self._thread = threading.Thread(target=self._serve, name="nulpaint-bridge", daemon=True)
         self._thread.start()
 
-    def _serve(self):
+    def _bind_server(self):
+        """Bind the bridge socket, returning (socket, port).
+
+        Default port taken by another instance -> fall back to a free ephemeral
+        port so a second Krita window still gets a bridge. An EXPLICIT
+        $NULPAINT_PORT that's busy raises (the client targets that exact port)."""
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((HOST, PORT))
+        try:
+            srv.bind((HOST, PORT))
+        except OSError:
+            if PORT_EXPLICIT:
+                srv.close()
+                raise
+            srv.bind((HOST, 0))  # 0 => let the OS pick a free port
         srv.listen(1)
+        return srv, srv.getsockname()[1]
+
+    def _serve(self):
+        _prune_instances()
+        try:
+            srv, port = self._bind_server()
+        except OSError as e:  # explicit port conflict — surface it, don't serve
+            print("nulpaint: bridge could not bind %s:%d (%s) — "
+                  "pick another NULPAINT_PORT" % (HOST, PORT, e))
+            return
         self._server = srv
+        self._port = port
+        _register_instance(HOST, port)
+        atexit.register(_unregister_instance, port)
+        print("nulpaint: bridge listening on %s:%d (pid %d)" % (HOST, port, os.getpid()))
         while True:
             conn, _addr = srv.accept()
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
@@ -1289,6 +1627,8 @@ class NulPaintExtension(Extension):
         # Hand the job to the GUI thread and block this socket thread for it.
         result_box, done = {"ok": False, "result": None, "error": None}, threading.Event()
         self._dispatcher.job.emit((cmd, req.get("args", {}), result_box, done))
-        done.wait(timeout=30)
+        # Most commands are quick; animation-frame import loads hundreds of PNGs on
+        # the GUI thread, so allow a generous ceiling before the socket gives up.
+        done.wait(timeout=600)
         return {"id": req.get("id"), "ok": result_box["ok"],
                 "result": result_box.get("result"), "error": result_box.get("error")}
