@@ -25,6 +25,7 @@ from PIL import Image
 from .bridge import BridgeClient
 
 ST = "/mnt/storage1/Pictures/Nuldrums/StreamToons"
+ANIM_ROOT = f"{ST}/Animations"
 NOBG_DIR = f"{ST}/Chibi_NoBG"
 CHROMA_DIR = f"{ST}/Chibi_ChromaBG"
 OBJECT_DIR = f"{ST}/OtherImages_NoBG"
@@ -197,3 +198,25 @@ def export_object(client: BridgeClient, *, layer_base: str, exp_name: str,
 
     return {"name": exp_name, "masked": bool(mask_uuid), "bbox": proj.getbbox(),
             "out": out, "game_out": game_out, "backed_up": int(backed)}
+
+
+def export_prone(client: BridgeClient, char: str) -> dict:
+    """Export a repositioned prone layer '<char>_Prone' from the OPEN ChibiToonEdits.kra
+    to a full-canvas 1024 RGBA PNG at Animations/<char>/<char>_Prone_final.png — i.e. the
+    same name as the source prone still with '_final' appended. The layer's current
+    on-canvas transform/scale/position is preserved (full-canvas grab). Any existing
+    _final PNG is backed up once to Animations/<char>/_final_bak/."""
+    layer_name = f"{char}_Prone"
+    r = client.call("layer.get_region", layer=layer_name, x=0, y=0, w=W, h=H)
+    proj = _b64_to_img(r["png_b64"])
+    bb = proj.getbbox()
+    if bb is None:
+        raise RuntimeError(f"{layer_name}: empty projection (layer blank or not found)")
+    out_dir = f"{ANIM_ROOT}/{char}"
+    if not os.path.isdir(out_dir):
+        raise RuntimeError(f"no animation folder for {char}: {out_dir}")
+    out = f"{out_dir}/{char}_Prone_final.png"
+    backed = _backup(out, f"{out_dir}/_final_bak")
+    proj.save(out)
+    return {"char": char, "layer": layer_name, "out": out, "bbox": bb,
+            "backed_up": int(backed)}

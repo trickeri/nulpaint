@@ -402,6 +402,50 @@ def cmd_export_object(a: argparse.Namespace) -> None:
           f"(masked={res['masked']}, bbox={res['bbox']}, backed_up={res['backed_up']})")
 
 
+def cmd_export_prone(a: argparse.Namespace) -> None:
+    from .chibi import export_prone
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        for char in a.chars:
+            res = export_prone(c, char)
+            print(f"nulpaint: exported {char}_Prone_final.png -> {res['out']}  "
+                  f"(bbox={res['bbox']}, backed_up={res['backed_up']})")
+
+
+def cmd_repose_still(a: argparse.Namespace) -> None:
+    from .repose import repose_still
+    out = a.out or (os.path.splitext(a.input)[0] + f"_{a.pose.capitalize()}.png")
+    green = None
+    if a.green:
+        green = tuple(int(v) for v in a.green.split(",")) if "," in a.green \
+            else (0, 177, 64)
+    res = repose_still(a.input, out, pose=a.pose, prompt=a.prompt, extra=a.extra,
+                       refs=a.ref, kind=("person" if a.person else "object"),
+                       model=a.nano_model, anchor=not a.no_anchor,
+                       pad_ref=a.pad_ref, green_bg=green)
+    print(f"nulpaint: reposed {os.path.basename(a.input)} -> {res['out']}  "
+          f"(pose={res['pose']}, gen={res['gen_size'][0]}x{res['gen_size'][1]}, "
+          f"bbox={res['final_bbox']})\n  raw gen kept at {res['raw']}")
+
+
+def cmd_repose_roster(a: argparse.Namespace) -> None:
+    from .repose import repose_roster
+    only = [s.strip() for s in a.only.split(",") if s.strip()] if a.only else None
+
+    def prog(row):
+        print(f"  [{row['status']}] {row['char']} -> {os.path.basename(row.get('out',''))}",
+              flush=True)
+
+    res = repose_roster(pose=a.pose, only=only, limit=a.limit, dry_run=a.dry_run,
+                        kind=("person" if a.person else "object"), model=a.nano_model,
+                        on_progress=None if a.dry_run else prog)
+    if a.dry_run:
+        for r in res["report"]:
+            src = os.path.basename(r["still"]) if r["still"] else "—"
+            print(f"  {r['char']:<18} <- {src:<28} [{r['status']}]")
+    print(f"nulpaint: {res['ok']}/{res['count']} reposed ({a.pose}).  "
+          f"review: {res['contact_sheet'] or res['review_dir']}")
+
+
 def cmd_rebuild_clip(a: argparse.Namespace) -> None:
     from .anim import rebuild_clip
     src = a.src or os.path.join(ANIM_ROOT, a.char)
@@ -513,6 +557,41 @@ def cmd_punch(a: argparse.Namespace) -> None:
                         black=a.black, white=a.white, gamma=a.gamma)
             print(f"nulpaint: punched '{label}' sat+{a.saturation} "
                   f"val+{a.value} black={a.black} white={a.white} gamma={a.gamma}")
+
+
+def cmd_mask_subtract(a: argparse.Namespace) -> None:
+    from .masksub import subtract_layer
+    # default grow: 0 for a hand-tuned selection (use it as-is), 3 for a mask layer
+    grow = a.grow if a.grow is not None else (0 if a.from_selection else 3)
+    with _connect(a.wait) as c:
+        r = subtract_layer(c, target=a.target, mask_layer=a.mask,
+                           from_selection=a.from_selection, grow=grow,
+                           threshold=a.threshold, in_place=a.in_place,
+                           suffix=a.suffix, hide_source=not a.keep_source_visible,
+                           clear_rgb=a.clear_rgb, set_selection=not a.no_selection)
+    where = f"'{r['target']}' in place" if r["in_place"] else f"copy '{r['cut_layer']}'"
+    grow_s = f" (grow {r['grow']}px)" if r["grow"] else ""
+    print(f"nulpaint: subtracted {r['source']}{grow_s} from {where} "
+          f"— erased {r['erased_px']} px"
+          + (f", hid original '{r['target']}'" if r["hid_source"] else ""))
+
+
+def cmd_mask_fill(a: argparse.Namespace) -> None:
+    from .masksub import fill_hole
+    with _connect(a.wait) as c:
+        r = fill_hole(c, target=a.target, pad=a.pad, radius=a.radius,
+                      layer_name=a.name, below=a.below)
+    print(f"nulpaint: content-aware filled {r['filled_px']} px -> new layer "
+          f"'{r['fill_layer']}' @({r['x']},{r['y']}) {r['w']}x{r['h']}")
+
+
+def cmd_mask_preview(a: argparse.Namespace) -> None:
+    from .masksub import preview_mask
+    with _connect(a.wait) as c:
+        r = preview_mask(c, mask_layer=a.mask, grow=a.grow, threshold=a.threshold)
+    verb = "grew" if a.grow > 0 else ("pulled in" if a.grow < 0 else "used exact")
+    print(f"nulpaint: previewed selection from '{r['mask_layer']}' — {verb} "
+          f"{abs(a.grow)}px stencil ({r['stencil_px']} px). No pixels cut.")
 
 
 def _nano_kwargs(a: argparse.Namespace) -> dict:
@@ -756,6 +835,63 @@ def build_parser() -> argparse.ArgumentParser:
                      help="levels gamma; <1 darkens mids, >1 lightens (default 1.0)")
     ppu.set_defaults(func=cmd_punch)
 
+    pms = sub.add_parser("mask-subtract",
+                         help="erase from TARGET everything under MASK layer's alpha "
+                              "(boolean layer subtract; e.g. cut foreground grass out "
+                              "of a baked ground layer)")
+    pms.add_argument("--target", required=True,
+                     help="layer to erase FROM (name or uuid)")
+    pms.add_argument("--mask", default=None,
+                     help="layer whose alpha is the stencil (name or uuid); "
+                          "omit when using --from-selection")
+    pms.add_argument("--from-selection", action="store_true", dest="from_selection",
+                     help="cut using the live document selection (feathered) instead "
+                          "of a mask layer — use after hand-brushing the selection")
+    pms.add_argument("--grow", type=int, default=None,
+                     help="dilate (+) / shrink (-) the stencil px (default: 3 for a "
+                          "mask layer, 0 for --from-selection so it's used as-is)")
+    pms.add_argument("--threshold", type=int, default=8,
+                     help="mask alpha above this counts as covered (default 8)")
+    pms.add_argument("--in-place", action="store_true", dest="in_place",
+                     help="cut the target directly instead of a hidden-original copy")
+    pms.add_argument("--suffix", default=" GrassRemoved",
+                     help="name suffix for the cut copy (default ' GrassRemoved')")
+    pms.add_argument("--keep-source-visible", action="store_true",
+                     dest="keep_source_visible",
+                     help="don't hide the original when making a copy")
+    pms.add_argument("--clear-rgb", action="store_true", dest="clear_rgb",
+                     help="also zero RGB under the stencil (default: alpha only)")
+    pms.add_argument("--no-selection", action="store_true", dest="no_selection",
+                     help="don't leave the grown stencil as the document selection")
+    pms.set_defaults(func=cmd_mask_subtract)
+
+    pmp = sub.add_parser("mask-preview",
+                         help="set the selection to a layer's (grown/eroded) alpha "
+                              "stencil WITHOUT cutting — dial --grow to eyeball reach")
+    pmp.add_argument("--mask", required=True,
+                     help="layer whose alpha is the stencil (name or uuid)")
+    pmp.add_argument("--grow", type=int, default=0,
+                     help="dilate (+) or pull IN (-) the stencil this many px (default 0)")
+    pmp.add_argument("--threshold", type=int, default=8,
+                     help="mask alpha above this counts as covered (default 8)")
+    pmp.set_defaults(func=cmd_mask_preview)
+
+    pmf = sub.add_parser("mask-fill",
+                         help="content-aware fill the selected hole by SAMPLING "
+                              "surrounding real pixels (no GPU) -> new layer")
+    pmf.add_argument("--target", default=None,
+                     help="layer the hole is in (name or uuid); default = active")
+    pmf.add_argument("--below", default="GroundPatch1_ForegroundGrass",
+                     help="place the fill layer directly below this layer "
+                          "(default GroundPatch1_ForegroundGrass); '' = below active")
+    pmf.add_argument("--name", default="GrassFill (patch)",
+                     help="name for the new fill layer")
+    pmf.add_argument("--pad", type=float, default=0.4,
+                     help="context margin around the hole bbox, fraction (default 0.4)")
+    pmf.add_argument("--radius", type=int, default=5,
+                     help="Telea inpaint radius px (default 5)")
+    pmf.set_defaults(func=cmd_mask_fill)
+
     pim = sub.add_parser("import-image",
                          help="import image file(s) as paint layer(s), optionally into a group")
     pim.add_argument("paths", nargs="+", help="image file(s) to import")
@@ -825,6 +961,13 @@ def build_parser() -> argparse.ArgumentParser:
     peo.add_argument("--game-dir", default=None, dest="game_dir",
                      help="also copy the PNG into this game Textures dir")
     peo.set_defaults(func=cmd_export_object)
+
+    pep = sub.add_parser("export-prone",
+                         help="export repositioned '<char>_Prone' layer(s) from the OPEN "
+                              "ChibiToonEdits.kra to Animations/<char>/<char>_Prone_final.png "
+                              "(full-canvas 1024 PNG, current transform preserved); backs up first")
+    pep.add_argument("chars", nargs="+", help="character name(s), e.g. Gorlunk1 Magi1 Magi3")
+    pep.set_defaults(func=cmd_export_prone)
 
     prc = sub.add_parser("rebuild-clip",
                          help="replace one animation clip in the OPEN character .kra with fresh "
@@ -945,6 +1088,49 @@ def build_parser() -> argparse.ArgumentParser:
     pcn.add_argument("--seed", type=int, default=-1)
     pcn.add_argument("--lora", default="", help="LoRA(s) as name[:weight], comma-separated")
     pcn.set_defaults(func=cmd_control)
+
+    prp = sub.add_parser("repose-still",
+                         help="generate a new-pose transparent still (Nano Banana), headless")
+    prp.add_argument("input", help="a transparent chibi still, e.g. .../Chibi_NoBG/Chibi_Cyren2.png")
+    prp.add_argument("-o", "--out", default=None,
+                     help="output PNG (default: <input>_<Pose>.png beside the input)")
+    prp.add_argument("--pose", default="prone",
+                     help="pose preset (default: prone) — see repose.POSE_PROMPTS")
+    prp.add_argument("--prompt", default=None,
+                     help="override the pose prompt entirely")
+    prp.add_argument("--extra", default=None,
+                     help="append text to the preset prompt (e.g. per-character notes)")
+    prp.add_argument("--ref", action="append", default=[],
+                     help="extra reference image for identity (repeatable)")
+    prp.add_argument("--person", action="store_true",
+                     help="strip bg with mattemodel (person) instead of segmodel (object, default)")
+    prp.add_argument("--nano-model", default=None, dest="nano_model",
+                     help="override the OpenRouter model slug")
+    prp.add_argument("--no-anchor", action="store_true",
+                     help="skip trim+ground-anchor; save the raw matte-stripped cut")
+    prp.add_argument("--pad-ref", default=None, dest="pad_ref", metavar="FILE",
+                     help="register scale/placement to this framed still (e.g. the "
+                          "idle Chibi_<Name>_Padded.png) so the pose lines up with an "
+                          "existing Kling frame; overrides ground-anchor")
+    prp.add_argument("--green", default=None, nargs="?", const="green", metavar="R,G,B",
+                     help="fill background with a chroma-key colour for Kling "
+                          "(bare flag = 0,177,64; or pass R,G,B)")
+    prp.set_defaults(func=cmd_repose_still)
+
+    prr = sub.add_parser("repose-roster",
+                         help="repose every Animations/<Char> from its source still, "
+                              "dropping <Char>_<Pose>.png into each folder")
+    prr.add_argument("--pose", default="prone", help="pose preset (default: prone)")
+    prr.add_argument("--only", default=None,
+                     help="comma list of character folders to limit to")
+    prr.add_argument("--limit", type=int, default=0, help="only the first N folders")
+    prr.add_argument("--dry-run", action="store_true",
+                     help="just resolve+print folder->still mapping, no API calls")
+    prr.add_argument("--person", action="store_true",
+                     help="strip bg with mattemodel (person) instead of segmodel (default)")
+    prr.add_argument("--nano-model", default=None, dest="nano_model",
+                     help="override the OpenRouter model slug")
+    prr.set_defaults(func=cmd_repose_roster)
 
     return p
 
