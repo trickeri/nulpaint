@@ -1141,11 +1141,271 @@ def _cmd_text_set(args):
             "old": old, "new": new_text}
 
 
+# --- first-class text verbs (size / font / colour / position) ----------------
+# So callers manipulate a text layer without hand-rolling SVG surgery. All work
+# by round-tripping the layer's own toSvg() and rewriting in place (same proven
+# mechanism as text.set), so untouched glyphs/kerning/per-run styling survive.
+
+_TEXT_STYLE_PROPS = {                 # arg name -> SVG property
+    "font_size": "font-size",
+    "font_family": "font-family",
+    "fill": "fill",
+}
+
+
+def _fmt(v):
+    """Compact number formatting (drop trailing zeros)."""
+    return ("%.4f" % float(v)).rstrip("0").rstrip(".")
+
+
+def _parse_text_transform(svg):
+    """(scale, tx, ty) from the <text> transform. Handles matrix(sx 0 0 sy e f)
+    and translate(x, y); defaults to (1, 0, 0)."""
+    m = re.search(r'<text[^>]*transform="([^"]*)"', svg)
+    if not m:
+        return 1.0, 0.0, 0.0
+    t = m.group(1)
+    mm = re.search(r'matrix\(([\-0-9.eE]+) 0 0 [\-0-9.eE]+ ([\-0-9.eE]+) ([\-0-9.eE]+)\)', t)
+    if mm:
+        return float(mm.group(1)), float(mm.group(2)), float(mm.group(3))
+    tm = re.search(r'translate\(([\-0-9.eE]+),?\s*([\-0-9.eE]+)\)', t)
+    if tm:
+        return 1.0, float(tm.group(1)), float(tm.group(2))
+    return 1.0, 0.0, 0.0
+
+
+def _set_text_transform(svg, scale, tx, ty):
+    """Rewrite the <text> transform to place the shape at (tx,ty) with uniform
+    `scale`. translate() when scale==1 (how Krita serializes it), else matrix()."""
+    if abs(float(scale) - 1.0) < 1e-9:
+        new = "translate(%s, %s)" % (_fmt(tx), _fmt(ty))
+    else:
+        new = "matrix(%s 0 0 %s %s %s)" % (_fmt(scale), _fmt(scale), _fmt(tx), _fmt(ty))
+    return re.subn(r'(<text[^>]*transform=")[^"]*"',
+                   lambda m: m.group(1) + new + '"', svg, count=1)
+
+
+def _text_props(node):
+    """Structured read of a text vector layer: text, font_size, font_family,
+    fill, anchor, align, scale, x, y."""
+    svg = node.toSvg()
+    def style(key):
+        m = re.search(r'%s:\s*([^;"\']+)' % re.escape(key), svg)
+        return m.group(1).strip() if m else None
+    def attr(key):
+        m = re.search(r'\b%s="([^"]*)"' % re.escape(key), svg)
+        return m.group(1) if m else None
+    scale, tx, ty = _parse_text_transform(svg)
+    fs = style("font-size")
+    return {
+        "text": "".join(re.findall(r'>([^<]*)</tspan>', svg)).strip(),
+        "font_size": float(fs) if fs else None,
+        "font_family": style("font-family"),
+        "fill": attr("fill"),
+        "anchor": attr("text-anchor"),
+        "align": style("text-align"),
+        "scale": scale, "x": tx, "y": ty,
+    }
+
+
+def _apply_text_props(node, props):
+    """Rewrite `node`'s SVG applying any of font_size/font_family/fill/text/
+    scale/x/y/translate present (non-None) in `props`. Returns (new_svg, applied)."""
+    svg = node.toSvg()
+    applied = {}
+    for key, prop in _TEXT_STYLE_PROPS.items():        # set every occurrence
+        if props.get(key) is not None:
+            svg, _ = _svg_set_prop(svg, prop, props[key])
+            applied[key] = props[key]
+    if props.get("text") is not None:
+        svg = re.sub(r'(>)[^<]*(</tspan>)',
+                     lambda m: m.group(1) + _xml_escape(str(props["text"])) + m.group(2),
+                     svg, count=1)
+        applied["text"] = props["text"]
+    if any(props.get(k) is not None for k in ("scale", "x", "y", "translate")):
+        cur_scale, cur_tx, cur_ty = _parse_text_transform(svg)
+        scale = props.get("scale", cur_scale)
+        tr = props.get("translate")
+        if tr and len(tr) == 2:
+            tx, ty = float(tr[0]), float(tr[1])
+        else:
+            tx = float(props["x"]) if props.get("x") is not None else cur_tx
+            ty = float(props["y"]) if props.get("y") is not None else cur_ty
+        svg, _ = _set_text_transform(svg, float(scale), tx, ty)
+        applied.update(scale=float(scale), x=tx, y=ty)
+    return svg, applied
+
+
+def _write_text_shapes(node, new_svg, doc, refresh=True):
+    for sh in node.shapes():
+        sh.remove()
+    node.addShapesFromSvg(new_svg)
+    if refresh:
+        doc.refreshProjection()
+
+
+def _cmd_text_get(args):
+    """Read a text vector layer's props (uuid|name|path|node): text, font_size,
+    font_family, fill, anchor, align, scale, x, y."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    if node.type() != "vectorlayer":
+        raise RuntimeError("not a vector layer: %s" % node.type())
+    props = _text_props(node)
+    props.update(uuid=_node_uuid(node), name=node.name())
+    return props
+
+
+def _cmd_text_set_props(args):
+    """Set any of font_size (pt), font_family, fill, text, scale (uniform mult),
+    x/y or translate=[x,y] on ONE text vector layer (uuid|name|path|node),
+    preserving everything else."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    node = _resolve_target(doc, args)
+    if node is None:
+        raise RuntimeError("node not found")
+    if node.type() != "vectorlayer":
+        raise RuntimeError("not a vector layer: %s" % node.type())
+    new_svg, applied = _apply_text_props(node, args)
+    if not applied:
+        raise RuntimeError("no text props given "
+                           "(font_size/font_family/fill/text/scale/x/y)")
+    _write_text_shapes(node, new_svg, doc, args.get("refresh", True))
+    return {"uuid": _node_uuid(node), "name": node.name(), "applied": applied}
+
+
+def _cmd_text_copy_props(args):
+    """Copy text props from a source layer onto many targets. args: src
+    (uuid|name|path|node); dst (list of uuid/name strings) and/or dst_name
+    (EVERY vector layer with this exact name); props (which to copy; default
+    ['font_size','font_family','fill','scale'] — position + text NOT copied so
+    each target keeps its own). keep_position=False also copies x/y."""
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    src = _resolve_target(doc, args)
+    if src is None or src.type() != "vectorlayer":
+        raise RuntimeError("source is not a vector text layer")
+    sp = _text_props(src)
+    which = list(args.get("props") or ["font_size", "font_family", "fill", "scale"])
+    if not args.get("keep_position", True):
+        which += ["x", "y"]
+    payload = {k: sp[k] for k in which if sp.get(k) is not None}
+
+    targets, seen = [], set()
+    for ident in (args.get("dst") or []):
+        n = _resolve_ident(doc, ident)
+        if n is not None and _node_uuid(n) not in seen:
+            targets.append(n); seen.add(_node_uuid(n))
+    dn = args.get("dst_name")
+    if dn:
+        for n in _walk_nodes(doc.rootNode()):
+            if (n.type() == "vectorlayer" and n.name() == dn
+                    and _node_uuid(n) != _node_uuid(src)
+                    and _node_uuid(n) not in seen):
+                targets.append(n); seen.add(_node_uuid(n))
+    if not targets:
+        raise RuntimeError("no targets (pass dst=[...] and/or dst_name)")
+
+    results = []
+    for n in targets:
+        if n.type() != "vectorlayer":
+            continue
+        new_svg, applied = _apply_text_props(n, payload)
+        _write_text_shapes(n, new_svg, doc, refresh=False)
+        results.append({"uuid": _node_uuid(n), "name": n.name(), "applied": applied})
+    doc.refreshProjection()
+    return {"source": _node_uuid(src), "copied": payload, "targets": results}
+
+
+def _activate_document_view(doc):
+    """Bring `doc`'s view/tab to the front so activeDocument() follows it.
+
+    Krita's `setActiveDocument()` sets the active-document POINTER but does NOT raise
+    the MDI subwindow when several docs are open, so activeDocument() keeps returning
+    whatever view still has focus. We raise the QMdiSubWindow that shows `doc`, which
+    is what actually switches the active view. Returns how it resolved (for debugging).
+    """
+    try:
+        from PyQt6.QtWidgets import QMdiArea  # type: ignore
+    except ImportError:  # pragma: no cover — Qt5 fallback
+        from PyQt5.QtWidgets import QMdiArea  # type: ignore
+    app = Krita.instance()
+    win = app.activeWindow()
+    if win is None:
+        app.setActiveDocument(doc)
+        return "no-window"
+    qwin = win.qwindow() if hasattr(win, "qwindow") else None
+    mdi = qwin.findChild(QMdiArea) if qwin is not None else None
+    if mdi is None:
+        app.setActiveDocument(doc)
+        return "no-mdi"
+
+    want = os.path.abspath(doc.fileName() or "")
+    wname = doc.name() or ""
+
+    def _is_target(ad):
+        if ad is None:
+            return False
+        try:
+            if want and os.path.abspath(ad.fileName() or "") == want:
+                return True
+        except Exception:
+            pass
+        return ad is doc or (bool(wname) and ad.name() == wname)
+
+    subs = mdi.subWindowList()
+    # 1) Fast path: match the subwindow by title (no view churn), then verify.
+    base = os.path.basename(want) if want else wname
+    if base:
+        for sub in subs:
+            if base in sub.windowTitle():
+                mdi.setActiveSubWindow(sub)
+                app.setActiveDocument(doc)
+                if _is_target(app.activeDocument()):
+                    return "activated-by-title"
+    # 2) Fallback: activate each subwindow and check which one yields `doc`.
+    original = mdi.activeSubWindow()
+    for sub in subs:
+        mdi.setActiveSubWindow(sub)
+        if _is_target(app.activeDocument()):
+            app.setActiveDocument(doc)
+            return "activated-by-probe"
+    # Nothing matched: restore the original view, best-effort set the pointer.
+    if original is not None:
+        mdi.setActiveSubWindow(original)
+    app.setActiveDocument(doc)
+    return "pointer-only"
+
+
+def _find_open_document(path=None, name=None):
+    """The open Document matching an absolute `path` (by fileName) or `name`, else None."""
+    app = Krita.instance()
+    if path:
+        p = os.path.abspath(os.path.expanduser(path))
+        for d in app.documents():
+            try:
+                if os.path.abspath(d.fileName() or "") == p:
+                    return d
+            except Exception:
+                continue
+    if name:
+        for d in app.documents():
+            if d.name() == name:
+                return d
+    return None
+
+
 def _cmd_document_open(args):
     """Open a document file and show it in a view/tab. args: path; set_active
-    (default True). If the file is already open, activates that doc instead of
-    opening a duplicate. Returns the doc's info (+ reused flag)."""
-    import os
+    (default True). If the file is already open, activates (raises the tab of) that
+    doc instead of opening a duplicate. Returns the doc's info (+ reused flag)."""
     path = args.get("path")
     if not path:
         raise RuntimeError("missing 'path'")
@@ -1153,26 +1413,34 @@ def _cmd_document_open(args):
     if not os.path.exists(path):
         raise RuntimeError("no such file: %s" % path)
     app = Krita.instance()
-    doc = None
-    for d in app.documents():                    # already open? -> reuse
-        try:
-            if os.path.abspath(d.fileName() or "") == path:
-                doc = d
-                break
-        except Exception:
-            continue
+    doc = _find_open_document(path=path)          # already open? -> reuse
     reused = doc is not None
+    activated = None
     if doc is None:
         doc = app.openDocument(path)
         if doc is None:
             raise RuntimeError("failed to open: %s" % path)
         win = app.activeWindow()
         if win is not None:
-            win.addView(doc)                     # show it in a tab
+            win.addView(doc)                     # show it in a tab (activates it)
     if args.get("set_active", True):
-        app.setActiveDocument(doc)
+        # setActiveDocument alone won't raise an already-open doc's tab; do it right.
+        activated = _activate_document_view(doc)
     return {"name": doc.name(), "fileName": doc.fileName(),
-            "width": doc.width(), "height": doc.height(), "reused": reused}
+            "width": doc.width(), "height": doc.height(), "reused": reused,
+            "activated": activated}
+
+
+def _cmd_document_activate(args):
+    """Raise an already-open document's tab/view to the front (switch the active
+    document). args: path OR name. Errors if no open doc matches."""
+    doc = _find_open_document(path=args.get("path"), name=args.get("name"))
+    if doc is None:
+        raise RuntimeError("no open document matching path/name: %r"
+                           % (args.get("path") or args.get("name")))
+    how = _activate_document_view(doc)
+    return {"name": doc.name(), "fileName": doc.fileName(),
+            "width": doc.width(), "height": doc.height(), "activated": how}
 
 
 def _cmd_document_export_png(args):
@@ -1287,6 +1555,16 @@ def _cmd_node_duplicate(args):
     dup = src.duplicate()
     if dup is None:
         raise RuntimeError("duplicate failed for: %s" % src.name())
+    # duplicate() copies an embedded layer style WITH THE SAME resource UUID, which
+    # leaves two layers claiming one style id (a "Duplicated UUID for styles" load
+    # warning + can confuse the projection). Round-trip the style through ASL so the
+    # copy gets a fresh KisPSDLayerStyle (new uuid). No-op for unstyled layers.
+    try:
+        asl = dup.layerStyleToAsl()
+        if asl:
+            dup.setLayerStyleFromAsl(asl)
+    except Exception:
+        pass
     dup.setName(args.get("name") or (src.name() + " nulpaint"))
     parent = src.parentNode() or doc.rootNode()
     parent.addChildNode(dup, src)          # insert directly above the source
@@ -1524,8 +1802,12 @@ COMMANDS = {
     "node.rename": _cmd_node_rename,
     "node.set_active": _cmd_node_set_active,
     "text.set": _cmd_text_set,
+    "text.get": _cmd_text_get,
+    "text.set_props": _cmd_text_set_props,
+    "text.copy_props": _cmd_text_copy_props,
     "document.export_png": _cmd_document_export_png,
     "document.open": _cmd_document_open,
+    "document.activate": _cmd_document_activate,
     "document.import_animation": _cmd_document_import_animation,
     "document.frame_info": _cmd_document_frame_info,
     "document.set_frame": _cmd_document_set_frame,

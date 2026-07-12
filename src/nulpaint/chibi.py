@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
 import shutil
 
 import numpy as np
@@ -105,6 +106,46 @@ def _backup(path: str, bakdir: str) -> bool:
     return False
 
 
+def _resolve_pb(exp_name: str, nb: tuple[int, int, int, int],
+                keep_aspect: bool) -> tuple[tuple[int, int, int, int], str]:
+    """The padded placement box + a human description of how it was derived. Prefers the
+    existing padded/green reference (pixel-position-identical placement); falls back to a
+    default 0.5-scale, feet-on-768, horizontally-centred box when there's no reference."""
+    pb = _padded_bbox(exp_name)
+    if pb is None:                          # no reference -> default padding
+        s = 0.5
+        cw, ch = round((nb[2] - nb[0]) * s), round((nb[3] - nb[1]) * s)
+        px0 = (W - cw) // 2
+        py0 = 768 - ch
+        return (px0, py0, px0 + cw, py0 + ch), "default(0.5,feet@768)"
+    if keep_aspect:
+        # The silhouette CHANGED (e.g. redrawn narrower), so fitting the new art into
+        # the old padded box would re-stretch it to the old width. Instead keep the
+        # reference's HEIGHT, feet line (bottom) and horizontal centre, and let WIDTH
+        # follow the new art's aspect ratio.
+        ref_h = pb[3] - pb[1]
+        ref_cx = (pb[0] + pb[2]) / 2.0
+        ref_bottom = pb[3]
+        aw, ah = nb[2] - nb[0], nb[3] - nb[1]
+        new_w = max(1, round(ref_h * aw / ah))
+        x0 = round(ref_cx - new_w / 2.0)
+        return (x0, ref_bottom - ref_h, x0 + new_w, ref_bottom), \
+            "keep-aspect(ref height/feet/centre, new width)"
+    return pb, "reference"
+
+
+def _compose(proj: Image.Image, nb: tuple[int, int, int, int],
+             pb: tuple[int, int, int, int]) -> tuple[Image.Image, Image.Image]:
+    """Scale the character (crop `nb`) into placement box `pb` on a 1024 transparent
+    canvas, and the same over solid chroma green. Returns (padded, green)."""
+    char = proj.crop(nb).resize((pb[2] - pb[0], pb[3] - pb[1]), Image.LANCZOS)
+    padded = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    padded.paste(char, (pb[0], pb[1]))
+    green = Image.new("RGBA", (W, H), GREEN + (255,))
+    green.alpha_composite(padded)
+    return padded, green
+
+
 def export_chibi(client: BridgeClient, *, layer_base: str, exp_name: str,
                  mask: bool = False, nobg_only: bool = False,
                  keep_aspect: bool = False) -> dict:
@@ -126,34 +167,8 @@ def export_chibi(client: BridgeClient, *, layer_base: str, exp_name: str,
         return {"name": exp_name, "masked": bool(mask_uuid), "native_bbox": nb,
                 "padded_bbox": None, "placement": "nobg-only", "backed_up": int(backed)}
 
-    pb = _padded_bbox(exp_name)
-    derived = "reference"
-    if pb is None:                          # no reference -> default padding
-        s = 0.5
-        cw, ch = round((nb[2] - nb[0]) * s), round((nb[3] - nb[1]) * s)
-        px0 = (W - cw) // 2
-        py0 = 768 - ch
-        pb = (px0, py0, px0 + cw, py0 + ch)
-        derived = "default(0.5,feet@768)"
-    elif keep_aspect:
-        # The silhouette CHANGED (e.g. redrawn narrower), so fitting the new art into
-        # the old padded box would re-stretch it to the old width. Instead keep the
-        # reference's HEIGHT, feet line (bottom) and horizontal centre, and let WIDTH
-        # follow the new art's aspect ratio.
-        ref_h = pb[3] - pb[1]
-        ref_cx = (pb[0] + pb[2]) / 2.0
-        ref_bottom = pb[3]
-        aw, ah = nb[2] - nb[0], nb[3] - nb[1]
-        new_w = max(1, round(ref_h * aw / ah))
-        x0 = round(ref_cx - new_w / 2.0)
-        pb = (x0, ref_bottom - ref_h, x0 + new_w, ref_bottom)
-        derived = "keep-aspect(ref height/feet/centre, new width)"
-
-    char = proj.crop(nb).resize((pb[2] - pb[0], pb[3] - pb[1]), Image.LANCZOS)
-    padded = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    padded.paste(char, (pb[0], pb[1]))
-    green = Image.new("RGBA", (W, H), GREEN + (255,))
-    green.alpha_composite(padded)
+    pb, derived = _resolve_pb(exp_name, nb, keep_aspect)
+    padded, green = _compose(proj, nb, pb)
 
     tight_p = f"{NOBG_DIR}/Chibi_{exp_name}.png"
     pad_p = f"{NOBG_DIR}/Chibi_{exp_name}_Padded.png"
@@ -220,3 +235,73 @@ def export_prone(client: BridgeClient, char: str) -> dict:
     proj.save(out)
     return {"char": char, "layer": layer_name, "out": out, "bbox": bb,
             "backed_up": int(backed)}
+
+
+# --- disk-only re-derivation (no Krita) ------------------------------------------------
+# The tight Chibi_<name>.png (native-position NoBG still) is the source of truth for a
+# character's *current* colours. After a recolour pass the padded + greenscreen files go
+# stale; these rebuild them from the tight file without re-opening the .kra. Recolour is
+# colour-only (alpha/silhouette unchanged), so re-applying the existing placement is
+# pixel-position-identical to the original padded art.
+
+def list_missing_padded() -> list[str]:
+    """Names with a tight Chibi_<name>.png but no Chibi_<name>_Padded.png."""
+    out = []
+    for f in sorted(os.listdir(NOBG_DIR)):
+        m = re.fullmatch(r"Chibi_(.+)\.png", f)
+        if not m:
+            continue
+        name = m.group(1)
+        if name.endswith(("_Padded", "_PaddedAnim")):
+            continue
+        if not os.path.exists(f"{NOBG_DIR}/Chibi_{name}_Padded.png"):
+            out.append(name)
+    return out
+
+
+def list_padded() -> list[str]:
+    """Names that currently have a Chibi_<name>_Padded.png (excludes _PaddedAnim)."""
+    out = []
+    for f in sorted(os.listdir(NOBG_DIR)):
+        m = re.fullmatch(r"Chibi_(.+)_Padded\.png", f)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def repad_chibi(exp_name: str, *, keep_aspect: bool = False) -> dict:
+    """Regenerate Chibi_<exp>_Padded.png from the existing tight (correctly-recoloured)
+    Chibi_<exp>.png, re-applying the placement from the existing padded/green reference.
+    For rebuilding a padded still after a recolour when the tight NoBG file is correct but
+    the padded one was deleted/stale. Backs up once. Does NOT touch the greenscreen file —
+    run regreen_chibi for that."""
+    tight = f"{NOBG_DIR}/Chibi_{exp_name}.png"
+    if not os.path.exists(tight):
+        raise RuntimeError(f"no tight source: {tight}")
+    proj = Image.open(tight).convert("RGBA")
+    nb = proj.getbbox()
+    if nb is None:
+        raise RuntimeError(f"{tight}: empty (fully transparent)")
+    pb, derived = _resolve_pb(exp_name, nb, keep_aspect)
+    padded, _ = _compose(proj, nb, pb)
+    pad_p = f"{NOBG_DIR}/Chibi_{exp_name}_Padded.png"
+    backed = _backup(pad_p, f"{NOBG_DIR}/_prepunch_bak")
+    padded.save(pad_p)
+    return {"name": exp_name, "out": pad_p, "placement": derived,
+            "padded_bbox": pb, "backed_up": int(backed)}
+
+
+def regreen_chibi(exp_name: str) -> dict:
+    """Regenerate Chibi_<exp>_GreenBG_Padded.png by compositing the current
+    Chibi_<exp>_Padded.png over solid chroma green. Backs up once. Run after repad so the
+    greenscreen matches the (re-coloured) padded art."""
+    pad_p = f"{NOBG_DIR}/Chibi_{exp_name}_Padded.png"
+    if not os.path.exists(pad_p):
+        raise RuntimeError(f"no padded source: {pad_p}")
+    padded = Image.open(pad_p).convert("RGBA")
+    green = Image.new("RGBA", (W, H), GREEN + (255,))
+    green.alpha_composite(padded)
+    green_p = f"{CHROMA_DIR}/Chibi_{exp_name}_GreenBG_Padded.png"
+    backed = _backup(green_p, f"{CHROMA_DIR}/_prepunch_bak")
+    green.save(green_p)
+    return {"name": exp_name, "out": green_p, "backed_up": int(backed)}

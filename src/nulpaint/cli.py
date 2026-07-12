@@ -241,7 +241,9 @@ def cmd_info(_a: argparse.Namespace) -> None:
 
 
 def cmd_save(a: argparse.Namespace) -> None:
-    with _connect(a.wait) as c:
+    # Saving a big cleanup .kra (hundreds of MB) can take well over the default 5s
+    # round-trip; use the same long socket timeout as the other heavy verbs.
+    with _connect(a.wait, sock_timeout=600.0) as c:
         print(json.dumps(c.save_document(a.path), indent=2))
 
 
@@ -379,7 +381,17 @@ def cmd_open(a: argparse.Namespace) -> None:
     with _connect(a.wait) as c:
         r = c.call("document.open", path=path)
     verb = "activated (already open)" if r.get("reused") else "opened"
-    print(f"nulpaint: {verb} {r['fileName']}  ({r['width']}x{r['height']})")
+    print(f"nulpaint: {verb} {r['fileName']}  ({r['width']}x{r['height']})"
+          f"  [{r.get('activated')}]")
+
+
+def cmd_activate(a: argparse.Namespace) -> None:
+    args = {"path": str(Path(a.target).expanduser().resolve())} if os.path.exists(
+        os.path.expanduser(a.target)) else {"name": a.target}
+    with _connect(a.wait) as c:
+        r = c.call("document.activate", **args)
+    print(f"nulpaint: activated {r['fileName'] or r['name']}  "
+          f"({r['width']}x{r['height']})  [{r['activated']}]")
 
 
 def cmd_export_chibi(a: argparse.Namespace) -> None:
@@ -409,6 +421,29 @@ def cmd_export_prone(a: argparse.Namespace) -> None:
             res = export_prone(c, char)
             print(f"nulpaint: exported {char}_Prone_final.png -> {res['out']}  "
                   f"(bbox={res['bbox']}, backed_up={res['backed_up']})")
+
+
+def cmd_repad(a: argparse.Namespace) -> None:
+    from .chibi import list_missing_padded, repad_chibi
+    names = a.names or (list_missing_padded() if a.missing else [])
+    if not names:
+        print("nulpaint: nothing to repad (pass names or --missing)")
+        return
+    for n in names:
+        res = repad_chibi(n, keep_aspect=a.keep_aspect)
+        print(f"nulpaint: repad Chibi_{n}_Padded.png  (placement={res['placement']}, "
+              f"bbox={res['padded_bbox']}, backed_up={res['backed_up']})")
+
+
+def cmd_regreen(a: argparse.Namespace) -> None:
+    from .chibi import list_padded, regreen_chibi
+    names = a.names or (list_padded() if a.all else [])
+    if not names:
+        print("nulpaint: nothing to regreen (pass names or --all)")
+        return
+    for n in names:
+        res = regreen_chibi(n)
+        print(f"nulpaint: regreen Chibi_{n}_GreenBG_Padded.png  (backed_up={res['backed_up']})")
 
 
 def cmd_repose_still(a: argparse.Namespace) -> None:
@@ -486,6 +521,19 @@ def cmd_despill_anim(a: argparse.Namespace) -> None:
     total = sum(cl["px"] for cl in res["clips"])
     print(f"nulpaint: green-eat edge despill on {a.char}: recoloured {total} px "
           f"(thr={a.thr} edge={a.edge}px)")
+    for cl in res["clips"]:
+        print(f"  - {cl['anim']}: {cl['recoloured_frames']}/{cl['frames']} frames touched, "
+              f"{cl['px']} px")
+
+
+def cmd_decyan_anim(a: argparse.Namespace) -> None:
+    from .anim import decyan_anim_frames
+    src = a.src or os.path.join(ANIM_ROOT, a.char)
+    only = [s.strip() for s in a.clips.split(",") if s.strip()] if a.clips else None
+    with _connect(a.wait, sock_timeout=600.0) as c:
+        res = decyan_anim_frames(c, char=a.char, src_dir=src, only=only, thr=a.thr)
+    total = sum(cl["px"] for cl in res["clips"])
+    print(f"nulpaint: de-cyan (cap G->R+{a.thr}) on {a.char}: capped {total} px")
     for cl in res["clips"]:
         print(f"  - {cl['anim']}: {cl['recoloured_frames']}/{cl['frames']} frames touched, "
               f"{cl['px']} px")
@@ -934,6 +982,12 @@ def build_parser() -> argparse.ArgumentParser:
     popen.add_argument("path", help="path to the .kra (or any Krita-openable) file")
     popen.set_defaults(func=cmd_open)
 
+    pact = sub.add_parser("activate",
+                          help="raise an already-open document's tab to the front (switch the "
+                               "active doc) by file path or by document name")
+    pact.add_argument("target", help="a path to an open doc's file, or its document name (e.g. Cyren1)")
+    pact.set_defaults(func=cmd_activate)
+
     pec = sub.add_parser("export-chibi",
                          help="export a chibi character's final art (punch + optional colour mask) "
                               "from the OPEN ChibiToonEdits.kra to the 3 still deliverables "
@@ -949,6 +1003,27 @@ def build_parser() -> argparse.ArgumentParser:
                           "height/feet/centre but let padded WIDTH follow the new aspect ratio "
                           "(don't re-stretch to the old box)")
     pec.set_defaults(func=cmd_export_chibi)
+
+    prpd = sub.add_parser("repad",
+                          help="regenerate Chibi_<name>_Padded.png from the tight (recoloured) "
+                               "Chibi_<name>.png in Chibi_NoBG, re-using the existing padded/green "
+                               "placement (pixel-identical); backs up first. No Krita needed.")
+    prpd.add_argument("names", nargs="*",
+                      help="character names, e.g. Cyren1 (default: none unless --missing)")
+    prpd.add_argument("--missing", action="store_true",
+                      help="repad every character that has a tight NoBG PNG but no _Padded.png")
+    prpd.add_argument("--keep-aspect", action="store_true", dest="keep_aspect",
+                      help="silhouette changed: keep ref height/feet/centre, width follows new aspect")
+    prpd.set_defaults(func=cmd_repad)
+
+    prg = sub.add_parser("regreen",
+                         help="regenerate Chibi_<name>_GreenBG_Padded.png by compositing the current "
+                              "_Padded.png over chroma green; backs up first. No Krita needed.")
+    prg.add_argument("names", nargs="*",
+                     help="character names (default: none unless --all)")
+    prg.add_argument("--all", action="store_true",
+                     help="regreen every character that has a _Padded.png")
+    prg.set_defaults(func=cmd_regreen)
 
     peo = sub.add_parser("export-object",
                          help="export a NON-character object's final '<base> (cut) nulpaint' layer "
@@ -1005,6 +1080,18 @@ def build_parser() -> argparse.ArgumentParser:
     pda.add_argument("--grow", type=int, default=2,
                      help="dilate the green mask along the soft edge (default 2)")
     pda.set_defaults(func=cmd_despill_anim)
+
+    pdc = sub.add_parser("decyan-anim",
+                         help="remove green-screen spill that reads as CYAN on a blue/purple "
+                              "subject (cap G->R+thr per keyframe) in the OPEN character .kra; for "
+                              "when green landed on blue tones so G==B and the green despill can't "
+                              "see it. Run after punch-anim, before re-export.")
+    pdc.add_argument("char", help="character name, e.g. Cyren1")
+    pdc.add_argument("--src", default=None, help=f"source folder (default {ANIM_ROOT}/<char>)")
+    pdc.add_argument("--clips", default=None, help="comma-separated animation names (default: all)")
+    pdc.add_argument("--thr", type=int, default=22,
+                     help="max green-over-red allowed; G above R+thr is capped (default 22)")
+    pdc.set_defaults(func=cmd_decyan_anim)
 
     pead = sub.add_parser("export-anim-doc",
                           help="re-export cleaned clips from the OPEN character .kra: timeline "

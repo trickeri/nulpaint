@@ -340,6 +340,73 @@ def despill_anim_frames(client: BridgeClient, *, char: str, src_dir: str,
             "params": {"thr": thr, "edge": edge, "grow": grow}}
 
 
+def decyan_anim_frames(client: BridgeClient, *, char: str, src_dir: str,
+                       only: list[str] | None = None, thr: int = 22,
+                       amin: int = 8) -> dict:
+    """Remove green-screen spill that reads as CYAN on a blue/purple subject, on EVERY
+    keyframe of each animation in the open <Char>.kra.
+
+    Green light landing on the character's blue tones pushes G up to ~B, so the pixel
+    goes cyan (G≈B, R suppressed) — which the green-eat / klingdespill despills can't see
+    (they cap green OVER max(R,B), and here G≈B so it never bites). Instead we cap G to
+    R+thr wherever G>R+thr, pulling the cyan back toward the subject's own blue/neutral
+    tone. RGB-only, alpha untouched, self-scoping: only pixels with G>R+thr change, so
+    blue-DOMINANT hair (B>G) and neutral/white areas are left alone. Run AFTER punch-anim
+    (the punch amplifies the cast). Requires <Char>.kra to be the active document."""
+    import numpy as np
+
+    from .despill import _b64_to_rgba, _rgba_to_b64
+
+    _require_active_doc(client, char)
+    layer_of = {}
+    for g in client.call("node.tree")["tree"]:
+        if g["type"] == "grouplayer" and g.get("children"):
+            for c in g["children"]:
+                if c["type"] == "paintlayer":
+                    layer_of[g["name"]] = c["uuid"]
+                    break
+
+    clips = discover_clips(src_dir, char)
+    if only:
+        want = {c.lower() for c in only}
+        clips = [(a, p) for (a, p) in clips if a.lower() in want]
+    if not clips:
+        raise RuntimeError(f"no matching clips for {char} in {src_dir}")
+    missing = [a for a, _ in clips if a not in layer_of]
+    if missing:
+        raise RuntimeError(f"open doc has no group(s) for: {', '.join(missing)} "
+                           f"— is {char}.kra the active document?")
+
+    info = client.call("document.info")
+    W, H = info["width"], info["height"]
+    orig_time = client.call("document.frame_info")["currentTime"]
+    results = []
+    try:
+        for anim, mov in clips:
+            n = frame_count(mov)
+            uuid = layer_of[anim]
+            client.call("node.set_active", node=uuid)      # get/set_region -> this layer
+            recol_frames, total_px = 0, 0
+            for t in range(n):
+                client.call("document.set_frame", time=t)
+                rgba = _b64_to_rgba(client.call("layer.get_region", x=0, y=0, w=W, h=H)["png_b64"])
+                a = rgba.astype(np.int16)
+                r, gch, al = a[..., 0], a[..., 1], a[..., 3]
+                target = (al > amin) & (gch > r + thr)
+                nn = int(target.sum())
+                if nn:
+                    a[..., 1] = np.where(target, r + thr, gch)   # cap G to R+thr (== min here)
+                    client.call("layer.set_region", x=0, y=0,
+                                png_b64=_rgba_to_b64(a.astype(np.uint8)))
+                    recol_frames += 1
+                    total_px += nn
+            results.append({"anim": anim, "frames": n,
+                            "recoloured_frames": recol_frames, "px": total_px})
+    finally:
+        client.call("document.set_frame", time=orig_time)
+    return {"char": char, "clips": results, "params": {"thr": thr}}
+
+
 def export_anim_doc(client: BridgeClient, *, char: str, src_dir: str,
                     out_dir: str | None = None, only: list[str] | None = None,
                     solidify: bool = True, fps_override: int | None = None) -> dict:
